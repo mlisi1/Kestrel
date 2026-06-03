@@ -13,36 +13,24 @@ import torch
 
 from PyQt5.QtCore    import Qt, QLocale, QTimer
 from PyQt5.QtWidgets import (
-    QApplication, QCheckBox, QDoubleSpinBox, QFormLayout, QGroupBox,
-    QHBoxLayout, QLabel, QMainWindow, QProgressBar, QPushButton,
-    QScrollArea, QSpinBox,
-    QVBoxLayout, QWidget,
+    QApplication, QHBoxLayout, QMainWindow, QScrollArea, QWidget,
 )
 
 _ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(_ROOT, "2d_gaussian_splatting"))
-
-_COMPRESSION_LABELS = [
-    "L0 — original",
-    "L1 — fp16",
-    "L2 — fp16 + SH1",
-    "L3 — fp16 + int8",
-]
 
 from cameras.cameras      import Cameras
 from utils.graphics_utils import fov2focal
 from renderer             import ViewerRenderer
 from model                import GaussianModelforViewer as GaussianModel
 from viewer.config        import (
-    UP_AXIS_OPTIONS, UP_AXIS_VECTORS,
-    AR_RATIO_OPTIONS, AR_RATIO_VALUES,
-    RESOLUTION_PRESETS,
+    UP_AXIS_VECTORS,
     RENDER_TYPES, RENDER_TYPE_MAP,
     load_config, save_config, fmt_splats,
 )
 from viewer.camera        import OrbitCamera
 from viewer.widgets       import RenderWidget
-from viewer.ui_helpers    import slider_spin, combo, NoScrollCombo
+from viewer.sidebar       import Sidebar
 from viewer.ply_loader    import (
     _detect_sh_degree, _idx_path, _compressed_ply_path, _load_octree,
     _load_ply_into_model, _read_ply_numpy, _install_numpy_into_model,
@@ -129,7 +117,7 @@ class LocalViewer(QMainWindow):
         self.split_enabled  = _mcfg.get("split_enabled", False)
         self.split_pos      = _mcfg.get("split_pos",     0.5)
         self.depth_ratio    = cfg["depth_ratio"]
-        self.sh_degree      = self._ply_sh_degree   # always start at max available
+        self.sh_degree      = self._ply_sh_degree
         self.opacity_thresh = cfg["opacity_thresh"]
         self.sparsity       = cfg["sparsity"]
         self.scaling_mod    = cfg["scaling_mod"]
@@ -197,9 +185,9 @@ class LocalViewer(QMainWindow):
         self.render_widget.key_down.connect(self._on_key_down)
         self.render_widget.key_up.connect(self._on_key_up)
 
-        controls = self._build_controls()
+        self._sidebar = Sidebar(self)
         scroll = QScrollArea()
-        scroll.setWidget(controls)
+        scroll.setWidget(self._sidebar.widget)
         scroll.setWidgetResizable(True)
         scroll.setFixedWidth(370)
         scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
@@ -212,278 +200,28 @@ class LocalViewer(QMainWindow):
         hl.addWidget(self.render_widget, 1)
         self.setCentralWidget(container)
 
-    def _group(self, title: str) -> tuple[QGroupBox, QFormLayout]:
-        g = QGroupBox(title)
-        f = QFormLayout(); f.setRowWrapPolicy(QFormLayout.WrapLongRows)
-        g.setLayout(f)
-        return g, f
+    # ── Settings helpers ───────────────────────────────────────────────────────
 
-    def _progress_bar(self) -> QProgressBar:
-        pb = QProgressBar()
-        pb.setRange(0, 0)
-        pb.setTextVisible(False)
-        pb.setFixedHeight(8)
-        pb.hide()
-        return pb
+    def _set(self, attr: str, val):
+        setattr(self, attr, val)
+        self._render_trig.set()
 
-    def _build_controls(self) -> QWidget:
-        w   = QWidget()
-        vbl = QVBoxLayout(w); vbl.setContentsMargins(4, 4, 4, 4)
-        self._build_culling_group(vbl)
-        self._build_compression_group(vbl)
-        self._build_status_group(vbl)
-        self._build_camera_group(vbl)
-        self._build_resolution_group(vbl)
-        self._build_render_group(vbl)
-        self._build_gaussian_group(vbl)
-        self._build_crop_group(vbl)
-        vbl.addStretch()
-        return w
+    def _set_crop(self, attr: str, idx: int, val: float):
+        getattr(self, attr)[idx] = val
+        self._render_trig.set()
 
-    def _build_culling_group(self, vbl: QVBoxLayout):
-        g, f = self._group("Frustum Culling")
-        self._culling_status_label = QLabel()
-        self._build_idx_btn = QPushButton()
-        self._build_idx_btn.clicked.connect(self._on_build_index)
-        self._leaf_max_spin = QSpinBox()
-        self._leaf_max_spin.setRange(100, 1_000_000)
-        self._leaf_max_spin.setSingleStep(1000)
-        self._leaf_max_spin.setValue(self._leaf_max)
-        self._leaf_max_spin.valueChanged.connect(lambda v: setattr(self, '_leaf_max', v))
-        self._culling_progress = self._progress_bar()
+    def _reset_camera(self):
+        self.camera.look_at  = np.array([0., 0., 0.])
+        self.camera.distance = 5.0
+        self.camera.yaw      = 0.0
+        self.camera.pitch    = 0.3
+        self._render_trig.set()
 
-        if self._no_culling_flag:
-            self._culling_status_label.setText("Disabled (--no-culling)")
-            self._culling_status_label.setStyleSheet("color: #888888;")
-            f.addRow("Status:", self._culling_status_label)
-        elif self.renderer.octree is not None:
-            n = len(self.renderer.octree["node_aabbs"])
-            self._culling_status_label.setText(f"Active — {n:,} leaves")
-            self._culling_status_label.setStyleSheet("color: #66cc66;")
-            self._build_idx_btn.setText("Rebuild Index")
-            f.addRow("Status:", self._culling_status_label)
-            f.addRow("Leaf size:", self._leaf_max_spin)
-            f.addRow(self._build_idx_btn)
-        else:
-            self._culling_status_label.setText("No index — culling disabled")
-            self._culling_status_label.setStyleSheet("color: #ff9900;")
-            self._build_idx_btn.setText("Build Index")
-            f.addRow("Status:", self._culling_status_label)
-            f.addRow("Leaf size:", self._leaf_max_spin)
-            f.addRow(self._build_idx_btn)
-        f.addRow(self._culling_progress)
-        vbl.addWidget(g)
+    def _on_world_up_changed(self, text: str):
+        self.camera.world_up = UP_AXIS_VECTORS[text].copy()
+        self._render_trig.set()
 
-    def _build_compression_group(self, vbl: QVBoxLayout):
-        g, f = self._group("Compression")
-        self._compression_combo = NoScrollCombo()
-        self._compression_combo.addItems(_COMPRESSION_LABELS)
-        self._compression_combo.blockSignals(True)
-        self._compression_combo.setCurrentIndex(self._current_compression)
-        self._compression_combo.blockSignals(False)
-        self._compression_combo.currentIndexChanged.connect(self._on_compression_changed)
-        self._compression_status_label = QLabel(f"L{self._current_compression} active")
-        self._compression_status_label.setStyleSheet("color: #66cc66;")
-        self._compress_progress = self._progress_bar()
-        f.addRow("Level:", self._compression_combo)
-        f.addRow("Status:", self._compression_status_label)
-        f.addRow(self._compress_progress)
-        vbl.addWidget(g)
-
-    def _build_status_group(self, vbl: QVBoxLayout):
-        g, f = self._group("Status")
-        self._fps_label   = QLabel("--")
-        self._gpu_label   = QLabel("--")
-        self._splat_label = QLabel("--")
-        f.addRow("FPS:",    self._fps_label)
-        f.addRow("Splats:", self._splat_label)
-        f.addRow("VRAM:",   self._gpu_label)
-
-        overlay_row = QWidget(); ol = QHBoxLayout(overlay_row); ol.setContentsMargins(0, 0, 0, 0)
-        fps_cb   = QCheckBox("FPS graph");   fps_cb.setChecked(self._show_fps_overlay)
-        splat_cb = QCheckBox("Splat graph"); splat_cb.setChecked(self._show_splat_overlay)
-        fps_cb.toggled.connect(lambda v: setattr(self.render_widget, '_show_fps_overlay',   v))
-        splat_cb.toggled.connect(lambda v: setattr(self.render_widget, '_show_splat_overlay', v))
-        ol.addWidget(fps_cb); ol.addWidget(splat_cb)
-        f.addRow("Overlays:", overlay_row)
-        vbl.addWidget(g)
-
-    def _build_camera_group(self, vbl: QVBoxLayout):
-        g, f = self._group("Camera")
-        f.addRow("World Up:", combo(UP_AXIS_OPTIONS, self._cfg["world_up"], self._on_world_up_changed))
-        f.addRow("FOV:",      slider_spin(10, 120, self.fov_deg, lambda v: self._set("fov_deg", float(v))))
-        f.addRow("Move Speed:",
-            slider_spin(0.1, 5.0, self._move_speed,
-                        lambda v: setattr(self, '_move_speed', v),
-                        is_float=True, decimals=2, step=0.05))
-        f.addRow("Orbit Speed:",
-            slider_spin(0.1, 5.0, self._orbit_speed,
-                        lambda v: setattr(self, '_orbit_speed', v),
-                        is_float=True, decimals=2, step=0.05))
-
-        mouse_row = QWidget(); ml = QHBoxLayout(mouse_row); ml.setContentsMargins(0,0,0,0)
-        minv_x = QCheckBox("Inv X"); minv_x.setChecked(self._cfg["mouse_inv_x"])
-        minv_y = QCheckBox("Inv Y"); minv_y.setChecked(self._cfg["mouse_inv_y"])
-        minv_x.toggled.connect(lambda v: setattr(self.render_widget, 'mouse_inv_x', v))
-        minv_y.toggled.connect(lambda v: setattr(self.render_widget, 'mouse_inv_y', v))
-        ml.addWidget(minv_x); ml.addWidget(minv_y)
-        f.addRow("Mouse Inv:", mouse_row)
-
-        kb_row = QWidget(); kl = QHBoxLayout(kb_row); kl.setContentsMargins(0,0,0,0)
-        kinv_x = QCheckBox("Inv X"); kinv_x.setChecked(self._cfg["kb_inv_x"])
-        kinv_y = QCheckBox("Inv Y"); kinv_y.setChecked(self._cfg["kb_inv_y"])
-        kinv_x.toggled.connect(lambda v: setattr(self, '_kb_inv_x', v))
-        kinv_y.toggled.connect(lambda v: setattr(self, '_kb_inv_y', v))
-        kl.addWidget(kinv_x); kl.addWidget(kinv_y)
-        f.addRow("KB Rot Inv:", kb_row)
-
-        btn_reset = QPushButton("Reset Camera")
-        btn_reset.clicked.connect(self._reset_camera)
-        f.addRow(btn_reset)
-        hint = QLabel("LMB: orbit  |  RMB: pan  |  Scroll: zoom\n"
-                      "WASD: translate  |  Arrows: FPS look  |  R: reset")
-        hint.setWordWrap(True)
-        f.addRow(hint)
-        vbl.addWidget(g)
-
-    def _build_resolution_group(self, vbl: QVBoxLayout):
-        g, f = self._group("Resolution")
-        self._res_width_spin = QSpinBox()
-        self._res_width_spin.setRange(2, 7680); self._res_width_spin.setSingleStep(2)
-
-        self._res_height_spin = QSpinBox()
-        self._res_height_spin.setRange(2, 4320); self._res_height_spin.setSingleStep(2)
-
-        self._ar_combo = NoScrollCombo()
-        self._ar_combo.addItems(AR_RATIO_OPTIONS)
-
-        self._ar_custom_spin = QDoubleSpinBox()
-        self._ar_custom_spin.setLocale(QLocale(QLocale.C))
-        self._ar_custom_spin.setRange(0.1, 10.0); self._ar_custom_spin.setDecimals(3)
-        self._ar_custom_spin.setSingleStep(0.001); self._ar_custom_spin.setFixedWidth(72)
-        self._ar_custom_spin.setValue(self._aspect_ratio)
-        self._ar_custom_spin.setEnabled(False)
-
-        self._lock_ar_cb = QCheckBox("Lock AR")
-        self._lock_ar_cb.setChecked(self._lock_ar)
-        self._lock_ar_cb.toggled.connect(lambda v: setattr(self, '_lock_ar', v))
-
-        preset_combo = NoScrollCombo()
-        preset_combo.addItems(list(RESOLUTION_PRESETS.keys()))
-        preset_combo.currentTextChanged.connect(self._on_preset_changed)
-        _preset = next(
-            (name for name, wh in RESOLUTION_PRESETS.items()
-             if wh is not None and wh == (self._render_w, self._render_h)),
-            "Custom"
-        )
-        preset_combo.blockSignals(True)
-        preset_combo.setCurrentText(_preset)
-        preset_combo.blockSignals(False)
-
-        for spin, val in [(self._res_width_spin, self._render_w),
-                          (self._res_height_spin, self._render_h)]:
-            spin.blockSignals(True); spin.setValue(val); spin.blockSignals(False)
-
-        self._res_width_spin.valueChanged.connect(self._on_width_changed)
-        self._res_height_spin.valueChanged.connect(self._on_height_changed)
-        self._ar_combo.currentTextChanged.connect(self._on_ar_combo_changed)
-        self._ar_custom_spin.valueChanged.connect(self._on_ar_custom_changed)
-        self._ar_combo.setCurrentText(self._cfg["ar_preset"])
-
-        wh_row = QWidget(); wl = QHBoxLayout(wh_row); wl.setContentsMargins(0, 0, 0, 0)
-        wl.addWidget(self._res_width_spin)
-        wl.addWidget(QLabel("×"))
-        wl.addWidget(self._res_height_spin)
-        f.addRow("Preset:", preset_combo)
-        f.addRow("Size:", wh_row)
-        ar_row = QWidget(); al = QHBoxLayout(ar_row); al.setContentsMargins(0,0,0,0)
-        al.addWidget(self._ar_combo, 2)
-        al.addWidget(self._ar_custom_spin, 1)
-        al.addWidget(self._lock_ar_cb, 1)
-        f.addRow("Aspect:", ar_row)
-        vbl.addWidget(g)
-
-    def _build_render_group(self, vbl: QVBoxLayout):
-        g, f = self._group("Render Options")
-        f.addRow("Type:", combo(RENDER_TYPES, self.render_type,
-            lambda v: self._set("render_type", v)))
-        f.addRow("Depth Ratio:",
-            slider_spin(0.0, 1.0, self.depth_ratio,
-                lambda v: self._set("depth_ratio", v),
-                is_float=True, decimals=2, step=0.05))
-        split_cb = QCheckBox()
-        split_cb.setChecked(self.split_enabled)
-        split_cb.toggled.connect(lambda v: self._set("split_enabled", v))
-        f.addRow("Split View:", split_cb)
-        f.addRow("Split Pos:",
-            slider_spin(0.0, 1.0, self.split_pos,
-                lambda v: self._set("split_pos", v),
-                is_float=True, decimals=2, step=0.01))
-        f.addRow("Left:",  combo(RENDER_TYPES, self.render_type1,
-            lambda v: self._set("render_type1", v)))
-        f.addRow("Right:", combo(RENDER_TYPES, self.render_type2,
-            lambda v: self._set("render_type2", v)))
-        vbl.addWidget(g)
-
-    def _build_gaussian_group(self, vbl: QVBoxLayout):
-        g, f = self._group("Gaussian Model")
-        self._sh_spin = QSpinBox()
-        self._sh_spin.setRange(0, self._ply_sh_degree)
-        self._sh_spin.setValue(self.sh_degree)
-        self._sh_spin.valueChanged.connect(lambda v: self._set("sh_degree", v))
-        f.addRow("SH Degree:", self._sh_spin)
-        f.addRow("Opacity Thr:",
-            slider_spin(0.0, 0.5, self.opacity_thresh,
-                lambda v: self._set("opacity_thresh", v),
-                is_float=True, decimals=3, step=0.005))
-        f.addRow("Sparsity:",
-            slider_spin(1, 10, self.sparsity,
-                lambda v: self._set("sparsity", int(v))))
-        f.addRow("Scale:",
-            slider_spin(0.1, 2.0, self.scaling_mod,
-                lambda v: self._set("scaling_mod", v),
-                is_float=True, decimals=2, step=0.05))
-        ptc_cb = QCheckBox()
-        ptc_cb.setChecked(self.show_ptc)
-        ptc_cb.toggled.connect(lambda v: self._set("show_ptc", v))
-        f.addRow("Pointcloud:", ptc_cb)
-        disk_cb = QCheckBox("disk mode")
-        disk_cb.setChecked(self.surfel_disk)
-        disk_cb.toggled.connect(lambda v: self._set("surfel_disk", v))
-        f.addRow("", disk_cb)
-        f.addRow("Point Size:",
-            slider_spin(0.001, 0.1, self.point_size,
-                lambda v: self._set("point_size", v),
-                is_float=True, decimals=3, step=0.001))
-        vbl.addWidget(g)
-
-    def _build_crop_group(self, vbl: QVBoxLayout):
-        g, f = self._group("Crop Box")
-        crop_cb = QCheckBox()
-        crop_cb.setChecked(self.crop_enabled)
-        crop_cb.toggled.connect(lambda v: self._set("crop_enabled", v))
-        f.addRow("Enable:", crop_cb)
-        for ax, attr in [("X", "crop_x"), ("Y", "crop_y"), ("Z", "crop_z")]:
-            vals = getattr(self, attr)
-            f.addRow(f"{ax} min:",
-                slider_spin(-16.0, 16.0, vals[0],
-                    lambda v, a=attr: self._set_crop(a, 0, v),
-                    is_float=True, decimals=1, step=0.1))
-            f.addRow(f"{ax} max:",
-                slider_spin(-16.0, 16.0, vals[1],
-                    lambda v, a=attr: self._set_crop(a, 1, v),
-                    is_float=True, decimals=1, step=0.1))
-        vbl.addWidget(g)
-
-    # ── Frustum culling build ──────────────────────────────────────────────────
-
-    def _on_build_index(self):
-        self._build_idx_btn.setEnabled(False)
-        self._build_idx_btn.setText("Building...")
-        self._culling_status_label.setText("Building index...")
-        self._culling_status_label.setStyleSheet("color: #aaaaaa;")
-        self._culling_progress.show()
-        threading.Thread(target=self._build_index_worker, daemon=True).start()
+    # ── Index build ────────────────────────────────────────────────────────────
 
     def _build_index_worker(self):
         from build_index import build_octree, read_xyz
@@ -508,30 +246,11 @@ class LocalViewer(QMainWindow):
             import traceback; traceback.print_exc()
             self._build_error_flag = True
 
-    def _on_culling_ready(self):
-        n = len(self.renderer.octree["node_aabbs"])
-        self._culling_status_label.setText(f"Active — {n:,} leaves")
-        self._culling_status_label.setStyleSheet("color: #66cc66;")
-        self._build_idx_btn.setEnabled(True)
-        self._build_idx_btn.setText("Rebuild Index")
-        self._culling_progress.hide()
-        self.render_widget._no_culling_warning = False
-        self.render_widget.update()
-
     # ── Compression ────────────────────────────────────────────────────────────
 
-    def _on_compression_changed(self, index: int):
-        if index == self._current_compression:
-            return
-        self._compression_combo.setEnabled(False)
-        label = _COMPRESSION_LABELS[index]
-        action = "Loading" if index == 0 or os.path.exists(
-            _compressed_ply_path(self.ply_path, index)) else "Compressing"
-        self._compression_status_label.setText(f"{action} {label.split(' — ')[0]}...")
-        self._compression_status_label.setStyleSheet("color: #aaaaaa;")
-        self._compress_progress.show()
+    def _start_compression(self, level: int):
         threading.Thread(target=self._compression_worker,
-                         args=(index,), daemon=True).start()
+                         args=(level,), daemon=True).start()
 
     def _compression_worker(self, level: int):
         try:
@@ -558,121 +277,6 @@ class LocalViewer(QMainWindow):
         except Exception:
             import traceback; traceback.print_exc()
             self._compress_error_flag = True
-
-    def _on_ply_loaded(self, level: int):
-        self._current_compression = level
-        self.sh_degree = self._ply_sh_degree           # always reset to new max
-        self._sh_spin.setMaximum(self._ply_sh_degree)
-        self._sh_spin.setValue(self._ply_sh_degree)
-        self._compression_status_label.setText(f"L{level} active")
-        self._compression_status_label.setStyleSheet("color: #66cc66;")
-        self._compression_combo.setEnabled(True)
-        self._compression_combo.blockSignals(True)
-        self._compression_combo.setCurrentIndex(level)
-        self._compression_combo.blockSignals(False)
-        self._compress_progress.hide()
-
-    # ── Settings helpers ───────────────────────────────────────────────────────
-
-    def _set(self, attr: str, val):
-        setattr(self, attr, val)
-        self._render_trig.set()
-
-    def _set_crop(self, attr: str, idx: int, val: float):
-        getattr(self, attr)[idx] = val
-        self._render_trig.set()
-
-    def _reset_camera(self):
-        self.camera.look_at  = np.array([0., 0., 0.])
-        self.camera.distance = 5.0
-        self.camera.yaw      = 0.0
-        self.camera.pitch    = 0.3
-        self._render_trig.set()
-
-    def _on_world_up_changed(self, text: str):
-        self.camera.world_up = UP_AXIS_VECTORS[text].copy()
-        self._render_trig.set()
-
-    # ── Resolution callbacks ───────────────────────────────────────────────────
-
-    def _on_width_changed(self, val: int):
-        self._render_w = val
-        if self._lock_ar:
-            new_h = max(2, round(val / self._aspect_ratio))
-            self._res_height_spin.blockSignals(True)
-            self._res_height_spin.setValue(new_h)
-            self._res_height_spin.blockSignals(False)
-            self._render_h = new_h
-        else:
-            self._aspect_ratio = val / max(self._render_h, 1)
-            self._ar_custom_spin.blockSignals(True)
-            self._ar_custom_spin.setValue(self._aspect_ratio)
-            self._ar_custom_spin.blockSignals(False)
-            self._ar_combo.blockSignals(True)
-            self._ar_combo.setCurrentText("Custom")
-            self._ar_combo.blockSignals(False)
-            self._ar_custom_spin.setEnabled(True)
-        self._render_trig.set()
-
-    def _on_height_changed(self, val: int):
-        self._render_h = val
-        if self._lock_ar:
-            new_w = max(2, round(val * self._aspect_ratio))
-            self._res_width_spin.blockSignals(True)
-            self._res_width_spin.setValue(new_w)
-            self._res_width_spin.blockSignals(False)
-            self._render_w = new_w
-        else:
-            self._aspect_ratio = max(self._render_w, 1) / val
-            self._ar_custom_spin.blockSignals(True)
-            self._ar_custom_spin.setValue(self._aspect_ratio)
-            self._ar_custom_spin.blockSignals(False)
-            self._ar_combo.blockSignals(True)
-            self._ar_combo.setCurrentText("Custom")
-            self._ar_combo.blockSignals(False)
-            self._ar_custom_spin.setEnabled(True)
-        self._render_trig.set()
-
-    def _on_preset_changed(self, text: str):
-        wh = RESOLUTION_PRESETS.get(text)
-        if wh is None:
-            return
-        w, h = wh
-        self._render_w = w; self._render_h = h
-        for spin, val in [(self._res_width_spin, w), (self._res_height_spin, h)]:
-            spin.blockSignals(True); spin.setValue(val); spin.blockSignals(False)
-        self._render_trig.set()
-
-    def _on_ar_combo_changed(self, text: str):
-        ratio = AR_RATIO_VALUES.get(text)
-        if ratio is None:
-            self._ar_custom_spin.setEnabled(True)
-            self._ar_custom_spin.blockSignals(True)
-            self._ar_custom_spin.setValue(self._aspect_ratio)
-            self._ar_custom_spin.blockSignals(False)
-            return
-        self._ar_custom_spin.setEnabled(False)
-        self._ar_custom_spin.blockSignals(True)
-        self._ar_custom_spin.setValue(ratio)
-        self._ar_custom_spin.blockSignals(False)
-        self._aspect_ratio = ratio
-        if self._lock_ar:
-            new_h = max(2, round(self._render_w / ratio))
-            self._res_height_spin.blockSignals(True)
-            self._res_height_spin.setValue(new_h)
-            self._res_height_spin.blockSignals(False)
-            self._render_h = new_h
-        self._render_trig.set()
-
-    def _on_ar_custom_changed(self, val: float):
-        self._aspect_ratio = max(0.1, val)
-        if self._lock_ar:
-            new_h = max(2, round(self._render_w / self._aspect_ratio))
-            self._res_height_spin.blockSignals(True)
-            self._res_height_spin.setValue(new_h)
-            self._res_height_spin.blockSignals(False)
-            self._render_h = new_h
-        self._render_trig.set()
 
     # ── Keyboard navigation ────────────────────────────────────────────────────
 
@@ -820,31 +424,23 @@ class LocalViewer(QMainWindow):
     def _poll_frame(self):
         if self._culling_enabled_flag:
             self._culling_enabled_flag = False
-            self._on_culling_ready()
+            self._sidebar.on_culling_ready(len(self.renderer.octree["node_aabbs"]))
+            self.render_widget._no_culling_warning = False
+            self.render_widget.update()
         if self._build_error_flag:
             self._build_error_flag = False
-            self._culling_status_label.setText("Build failed — see console")
-            self._culling_status_label.setStyleSheet("color: #ff4444;")
-            self._build_idx_btn.setEnabled(True)
-            self._build_idx_btn.setText("Retry Build")
-            self._culling_progress.hide()
+            self._sidebar.on_build_error()
         lvl = self._ply_loaded_level
         if lvl is not None:
             self._ply_loaded_level = None
-            self._on_ply_loaded(lvl)
+            self.sh_degree = self._ply_sh_degree
+            self._sidebar.on_ply_loaded(lvl, self._ply_sh_degree)
         if self._compress_error_flag:
             self._compress_error_flag = False
-            self._compression_status_label.setText("Failed — see console")
-            self._compression_status_label.setStyleSheet("color: #ff4444;")
-            self._compression_combo.blockSignals(True)
-            self._compression_combo.setCurrentIndex(self._current_compression)
-            self._compression_combo.blockSignals(False)
-            self._compression_combo.setEnabled(True)
-            self._compress_progress.hide()
+            self._sidebar.on_compress_error(self._current_compression)
 
         with self._frame_lock:
-            slot = self._frame_slot
-            self._frame_slot = None
+            slot, self._frame_slot = self._frame_slot, None
         if slot is None:
             return
         img_np, fps_str, gpu_str, fps_val, n_splats, splat_str = slot
@@ -853,9 +449,7 @@ class LocalViewer(QMainWindow):
             self.render_widget.update_fps(fps_val)
         if n_splats > 0:
             self.render_widget.update_splat_count(n_splats)
-        self._fps_label.setText(fps_str)
-        self._splat_label.setText(splat_str)
-        self._gpu_label.setText(gpu_str)
+        self._sidebar.update_stats(fps_str, splat_str, gpu_str)
 
     # ── Lifecycle ──────────────────────────────────────────────────────────────
 
@@ -864,6 +458,7 @@ class LocalViewer(QMainWindow):
         self._render_trig.set()
         _up_key = next((k for k, v in UP_AXIS_VECTORS.items()
                         if np.allclose(v, self.camera.world_up)), "+Z")
+        ui = self._sidebar.ui_state_for_config()
         self._cfg.update({
             "fov_deg":            self.fov_deg,
             "move_speed":         self._move_speed,
@@ -875,7 +470,7 @@ class LocalViewer(QMainWindow):
             "world_up":           _up_key,
             "render_w":           self._render_w,
             "render_h":           self._render_h,
-            "ar_preset":          self._ar_combo.currentText(),
+            "ar_preset":          ui["ar_preset"],
             "lock_ar":            self._lock_ar,
             "depth_ratio":        self.depth_ratio,
             "active_sh_degree":   self.sh_degree,
@@ -884,11 +479,10 @@ class LocalViewer(QMainWindow):
             "scaling_mod":        self.scaling_mod,
             "point_size":         self.point_size,
             "render_type":        self.render_type,
-            "show_fps_overlay":   self.render_widget._show_fps_overlay,
-            "show_splat_overlay": self.render_widget._show_splat_overlay,
+            "show_fps_overlay":   ui["show_fps_overlay"],
+            "show_splat_overlay": ui["show_splat_overlay"],
         })
         save_config(self._cfg)
-        # Per-model config: global settings + camera pose + model-specific state
         save_model_config(self.ply_path, {
             **self._cfg,
             "camera_look_at":   self.camera.look_at.tolist(),

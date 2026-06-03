@@ -46,6 +46,13 @@ RENDER_TYPES = [
     "RGB", "Edge", "Alpha", "Normal", "View-Normal",
     "Depth", "Depth-Distort", "Depth-to-Normal", "Depth-to-Curvature",
 ]
+COMPRESSION_LABELS = [
+    "L0 — original",
+    "L1 — fp16",
+    "L2 — fp16 + SH1",
+    "L3 — fp16 + int8",
+]
+
 RENDER_TYPE_MAP = {
     "RGB":                "render",
     "Edge":               "edge",
@@ -71,7 +78,7 @@ CONFIG_DEFAULTS: dict = {
     "move_speed":         1.0,
     "orbit_speed":        1.0,
     "mouse_inv_x":        True,
-    "mouse_inv_y":        True,
+    "mouse_inv_y":        False,
     "kb_inv_x":           True,
     "kb_inv_y":           True,
     "world_up":           "+Z",
