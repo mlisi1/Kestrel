@@ -1,4 +1,4 @@
-"""LocalViewer: native single-window 2DGS viewer using PyQt5."""
+"""Kestrel: native single-window 2DGS viewer using PyQt5."""
 
 from __future__ import annotations
 
@@ -13,159 +13,75 @@ import torch
 
 from PyQt5.QtCore    import Qt, QLocale, QTimer
 from PyQt5.QtWidgets import (
-    QApplication, QCheckBox, QFormLayout, QGroupBox,
-    QHBoxLayout, QLabel, QMainWindow, QPushButton,
-    QScrollArea, QSizePolicy, QSpinBox, QDoubleSpinBox,
-    QSplitter, QVBoxLayout, QWidget,
+    QApplication, QCheckBox, QDoubleSpinBox, QFormLayout, QGroupBox,
+    QHBoxLayout, QLabel, QMainWindow, QProgressBar, QPushButton,
+    QScrollArea, QSpinBox,
+    QVBoxLayout, QWidget,
 )
 
 _ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(_ROOT, "2d_gaussian_splatting"))
 
-from cameras.cameras          import Cameras
-from utils.graphics_utils      import fov2focal
-from renderer                  import ViewerRenderer
-from model                     import GaussianModelforViewer as GaussianModel
-from viewer.config             import (
+_COMPRESSION_LABELS = [
+    "L0 — original",
+    "L1 — fp16",
+    "L2 — fp16 + SH1",
+    "L3 — fp16 + int8",
+]
+
+from cameras.cameras      import Cameras
+from utils.graphics_utils import fov2focal
+from renderer             import ViewerRenderer
+from model                import GaussianModelforViewer as GaussianModel
+from viewer.config        import (
     UP_AXIS_OPTIONS, UP_AXIS_VECTORS,
     AR_RATIO_OPTIONS, AR_RATIO_VALUES,
     RESOLUTION_PRESETS,
     RENDER_TYPES, RENDER_TYPE_MAP,
-    CONFIG_DEFAULTS, load_config, save_config, fmt_splats,
+    load_config, save_config, fmt_splats,
 )
-from viewer.camera             import OrbitCamera
-from viewer.widgets            import RenderWidget
-from viewer.ui_helpers         import slider_spin, combo
-
-from PyQt5.QtWidgets import QComboBox
-
-
-def _detect_sh_degree(path: str) -> int:
-    from plyfile import PlyData
-    el = PlyData.read(path).elements[0]
-    n_rest = sum(1 for p in el.properties if p.name.startswith("f_rest_"))
-    if n_rest == 0:
-        return 0
-    for deg in range(1, 5):
-        if 3 * ((deg + 1) ** 2 - 1) == n_rest:
-            return deg
-    raise ValueError(f"Cannot determine SH degree: {n_rest} f_rest_ properties in {path}")
-
-
-def _idx_path(ply_path: str) -> str:
-    """<iteration_dir>/.kestrel/<ply_stem>.idx"""
-    iteration_dir = os.path.dirname(os.path.abspath(ply_path))
-    stem = os.path.splitext(os.path.basename(ply_path))[0]
-    return os.path.join(iteration_dir, ".kestrel", stem + ".idx")
-
-
-def _load_octree(ply_path: str) -> dict | None:
-    import numpy as _np
-    idx_path = _idx_path(ply_path)
-    if not os.path.exists(idx_path):
-        print(f"[viewer] No octree index found at {idx_path} — frustum culling disabled")
-        return None
-    data = _np.load(idx_path)
-    L = len(data["node_aabbs"])
-    print(f"[viewer] Loaded octree index: {L:,} leaf nodes from {idx_path}")
-    return {"node_aabbs":   data["node_aabbs"],
-            "node_offsets": data["node_offsets"],
-            "flat_indices": data["flat_indices"]}
-
-
-def _load_ply_into_model(model, path: str) -> None:
-    """Load a 2DGS .ply file into a GaussianModel."""
-    from plyfile import PlyData
-    import numpy as _np
-
-    FP16_MAX = 65504.0
-    el = PlyData.read(path).elements[0]
-
-    def _sorted(prefix):
-        names = [p.name for p in el.properties if p.name.startswith(prefix)]
-        return sorted(names, key=lambda x: int(x.split("_")[-1]))
-
-    def _stack(names):
-        return _np.stack([_np.asarray(el[n]) for n in names], axis=1).astype(_np.float32)
-
-    def _safe(arr, label=""):
-        n_bad = int(_np.sum(~_np.isfinite(arr)))
-        if n_bad > 0:
-            print(f"[viewer]   {label}: zeroing {n_bad:,} NaN/Inf values")
-            arr = _np.where(_np.isfinite(arr), arr, 0.0)
-        if _np.abs(arr).max() > FP16_MAX:
-            thr = float(min(_np.percentile(_np.abs(arr), 99.9), FP16_MAX))
-            n_c = int(_np.sum(_np.abs(arr) > thr))
-            print(f"[viewer]   {label}: clipping {n_c:,} overflow values to ±{thr:.1f}")
-            arr = _np.clip(arr, -thr, thr)
-        return arr
-
-    xyz       = _safe(_stack(["x", "y", "z"]),                                  "xyz")
-    opacities = _safe(_np.asarray(el["opacity"], dtype=_np.float32)[..., None],  "opacity")
-    scales    = _safe(_stack(_sorted("scale_")),                                 "scale")
-    rotations = _safe(_stack(_sorted("rot_")),                                   "rotation")
-    features_dc = _safe(_stack(_sorted("f_dc_")), "f_dc")[:, _np.newaxis, :]
-
-    f_rest_names = _sorted("f_rest_")
-    if f_rest_names:
-        f_rest_flat = _safe(_stack(f_rest_names), "f_rest")   # [N, 3*K]
-        n_coeffs    = f_rest_flat.shape[1]
-        file_sh     = next((d for d in range(1, 5)
-                            if 3 * ((d + 1) ** 2 - 1) == n_coeffs), 0)
-        K           = (file_sh + 1) ** 2 - 1
-        features_rest = f_rest_flat.reshape((-1, 3, K)).transpose(0, 2, 1)   # [N, K, 3]
-        print(f"[viewer]   SH degree: {file_sh} ({n_coeffs} f_rest_ props)")
-    else:
-        features_rest = _np.zeros((xyz.shape[0], 0, 3), dtype=_np.float32)
-        file_sh = 0
-        print("[viewer]   No f_rest_ — degree-0 (view-independent colour)")
-
-    def _cuda(a):
-        return torch.from_numpy(a.astype(_np.float32)).cuda()
-
-    model._xyz           = _cuda(xyz)
-    model._opacity       = _cuda(opacities)
-    model._features_dc   = _cuda(features_dc)
-    model._features_rest = _cuda(features_rest)
-    model._scaling       = _cuda(scales)
-    model._rotation      = _cuda(rotations)
-
-    if hasattr(model, "active_sh_degree"):
-        model.active_sh_degree = file_sh
-    if hasattr(model, "max_sh_degree"):
-        model.max_sh_degree = min(model.max_sh_degree, file_sh)
-
-    vram_mb = sum(
-        t.element_size() * t.nelement()
-        for t in [model._xyz, model._opacity, model._features_dc,
-                  model._features_rest, model._scaling, model._rotation]
-    ) / 1024 / 1024
-    print(f"[viewer]   Loaded {xyz.shape[0]:,} splats — {vram_mb:.0f} MB VRAM")
+from viewer.camera        import OrbitCamera
+from viewer.widgets       import RenderWidget
+from viewer.ui_helpers    import slider_spin, combo, NoScrollCombo
+from viewer.ply_loader    import (
+    _detect_sh_degree, _idx_path, _compressed_ply_path, _load_octree,
+    _load_ply_into_model, _read_ply_numpy, _install_numpy_into_model,
+    load_model_config, save_model_config,
+)
 
 
 class LocalViewer(QMainWindow):
 
     def __init__(self, ply_path: str, args):
         super().__init__()
-        self.device          = torch.device("cuda")
-        self.ply_path        = ply_path
-        self._leaf_max       = getattr(args, 'leaf_max', 5000)
+        self.device           = torch.device("cuda")
+        self.ply_path         = ply_path
+        self._leaf_max        = getattr(args, 'leaf_max', 5000)
         self._no_culling_flag = getattr(args, 'no_culling', False)
-        self.cam_tf          = torch.eye(4, dtype=torch.float64)
+        self.cam_tf           = torch.eye(4, dtype=torch.float64)
 
-        # Config (loaded before model so defaults are available everywhere)
+        # Config: global defaults merged with per-model saved state
         self._cfg = load_config()
         cfg = self._cfg
+        _mcfg = load_model_config(ply_path)
+        cfg.update({k: _mcfg[k] for k in _mcfg if k in cfg})
 
-        # Load model
-        sh = _detect_sh_degree(ply_path) if args.sh_degree < 0 else args.sh_degree
-        self._max_sh = sh
+        # Determine which PLY to load (restore last-used compression level)
+        _start_compression = int(_mcfg.get("compression", 0))
+        if _start_compression > 0:
+            if not os.path.exists(_compressed_ply_path(ply_path, _start_compression)):
+                _start_compression = 0
+        _load_path = (_compressed_ply_path(ply_path, _start_compression)
+                      if _start_compression > 0 else ply_path)
+
+        sh = _detect_sh_degree(_load_path) if args.sh_degree < 0 else args.sh_degree
+        self._ply_sh_degree       = sh
+        self._current_compression = _start_compression
         model = GaussianModel(sh_degree=sh)
-        _load_ply_into_model(model, ply_path)
+        _load_ply_into_model(model, _load_path)
 
         if getattr(args, 'build_index', False):
             from build_index import build_octree, read_xyz
-            import numpy as _np
             idx_path = _idx_path(ply_path)
             os.makedirs(os.path.dirname(idx_path), exist_ok=True)
             leaf_max = getattr(args, 'leaf_max', 5000)
@@ -175,9 +91,9 @@ class LocalViewer(QMainWindow):
             node_aabbs, node_offsets, flat_indices = build_octree(xyz, leaf_max=leaf_max)
             print(f"[viewer]   Done in {time.perf_counter()-t0:.1f}s — saving to {idx_path}")
             with open(idx_path, "wb") as fh:
-                _np.savez_compressed(fh, node_aabbs=node_aabbs,
-                                      node_offsets=node_offsets,
-                                      flat_indices=flat_indices)
+                np.savez_compressed(fh, node_aabbs=node_aabbs,
+                                    node_offsets=node_offsets,
+                                    flat_indices=flat_indices)
             octree = {"node_aabbs": node_aabbs, "node_offsets": node_offsets,
                       "flat_indices": flat_indices}
         else:
@@ -194,67 +110,67 @@ class LocalViewer(QMainWindow):
             profiling_enabled=not getattr(args, 'no_profiling', False),
         )
 
-        # Camera
-        self.camera = OrbitCamera(
-            world_up=UP_AXIS_VECTORS[cfg["world_up"]].copy()
-        )
+        self.camera = OrbitCamera(world_up=UP_AXIS_VECTORS[cfg["world_up"]].copy())
+        if "camera_look_at" in _mcfg:
+            self.camera.look_at  = np.array(_mcfg["camera_look_at"], dtype=np.float64)
+            self.camera.distance = float(_mcfg.get("camera_distance", 5.0))
+            self.camera.yaw      = float(_mcfg.get("camera_yaw",     0.0))
+            self.camera.pitch    = float(_mcfg.get("camera_pitch",   0.3))
 
-        # Render resolution
         self._render_w     = cfg["render_w"]
         self._render_h     = cfg["render_h"]
         self._aspect_ratio = cfg["render_w"] / max(cfg["render_h"], 1)
         self._lock_ar      = cfg["lock_ar"]
 
-        # Render options
         self.fov_deg        = cfg["fov_deg"]
         self.render_type    = cfg["render_type"] if cfg["render_type"] in RENDER_TYPES else "RGB"
-        self.render_type1   = "RGB"
-        self.render_type2   = "RGB"
-        self.split_enabled  = False
-        self.split_pos      = 0.5
+        self.render_type1   = _mcfg.get("render_type1",  "RGB")
+        self.render_type2   = _mcfg.get("render_type2",  "RGB")
+        self.split_enabled  = _mcfg.get("split_enabled", False)
+        self.split_pos      = _mcfg.get("split_pos",     0.5)
         self.depth_ratio    = cfg["depth_ratio"]
-        _sh_cfg             = cfg["active_sh_degree"]
-        self.sh_degree      = sh if _sh_cfg < 0 else min(_sh_cfg, sh)
+        self.sh_degree      = self._ply_sh_degree   # always start at max available
         self.opacity_thresh = cfg["opacity_thresh"]
         self.sparsity       = cfg["sparsity"]
         self.scaling_mod    = cfg["scaling_mod"]
         self.point_size     = cfg["point_size"]
-        self.show_ptc       = False
-        self.surfel_disk    = False
-        self.crop_enabled   = False
-        self.crop_x         = [-4.0, 4.0]
-        self.crop_y         = [-4.0, 4.0]
-        self.crop_z         = [-4.0, 4.0]
+        self.show_ptc       = _mcfg.get("show_ptc",     False)
+        self.surfel_disk    = _mcfg.get("surfel_disk",  False)
+        self.crop_enabled   = _mcfg.get("crop_enabled", False)
+        self.crop_x         = _mcfg.get("crop_x",       [-4.0, 4.0])
+        self.crop_y         = _mcfg.get("crop_y",       [-4.0, 4.0])
+        self.crop_z         = _mcfg.get("crop_z",       [-4.0, 4.0])
 
-        # Navigation speeds (multipliers)
         self._move_speed  = cfg["move_speed"]
         self._orbit_speed = cfg["orbit_speed"]
 
-        # KB rotation inversion (arrow keys only, not WASD)
         self._kb_inv_x  = cfg["kb_inv_x"]
         self._kb_inv_y  = cfg["kb_inv_y"]
         self._keys_held = set()
 
-        # Overlay visibility
         self._show_fps_overlay   = cfg["show_fps_overlay"]
         self._show_splat_overlay = cfg["show_splat_overlay"]
 
-        # Frame slot
         self._frame_slot  = None
         self._frame_lock  = threading.Lock()
         self._render_trig = threading.Event()
         self._running     = True
 
-        # Background index build state (written by worker thread, read by render/poll threads)
-        self._octree_pending       = None   # set to dict when build finishes
-        self._culling_enabled_flag = False  # set True by render loop after octree install
-        self._build_error_flag     = False  # set True by worker on failure
+        # Background index build state
+        self._octree_pending       = None
+        self._culling_enabled_flag = False
+        self._build_error_flag     = False
+
+        # Background PLY compression/load state
+        self._ply_pending         = None
+        self._ply_loaded_level    = None
+        self._compress_error_flag = False
 
         self._build_ui()
 
         if not self._no_culling_flag and self.renderer.octree is None:
             self.render_widget._no_culling_warning = True
-        self._start_render_thread()
+        threading.Thread(target=self._render_loop, daemon=True).start()
 
         self._poll_timer = QTimer()
         self._poll_timer.timeout.connect(self._poll_frame)
@@ -269,7 +185,7 @@ class LocalViewer(QMainWindow):
     # ── UI construction ────────────────────────────────────────────────────────
 
     def _build_ui(self):
-        self.setWindowTitle("2DGS Viewer")
+        self.setWindowTitle("Kestrel")
         self.resize(1640, 900)
 
         self.render_widget = RenderWidget(self.camera)
@@ -277,7 +193,7 @@ class LocalViewer(QMainWindow):
         self.render_widget.mouse_inv_y         = self._cfg["mouse_inv_y"]
         self.render_widget._show_fps_overlay   = self._show_fps_overlay
         self.render_widget._show_splat_overlay = self._show_splat_overlay
-        self.render_widget.camera_changed.connect(self._on_camera_change)
+        self.render_widget.camera_changed.connect(lambda: self._render_trig.set())
         self.render_widget.key_down.connect(self._on_key_down)
         self.render_widget.key_up.connect(self._on_key_up)
 
@@ -288,13 +204,13 @@ class LocalViewer(QMainWindow):
         scroll.setFixedWidth(370)
         scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
 
-        splitter = QSplitter(Qt.Horizontal)
-        splitter.addWidget(scroll)
-        splitter.addWidget(self.render_widget)
-        splitter.setSizes([370, 1270])
-        splitter.setCollapsible(0, False)
-        splitter.setCollapsible(1, False)
-        self.setCentralWidget(splitter)
+        container = QWidget()
+        hl = QHBoxLayout(container)
+        hl.setContentsMargins(0, 0, 0, 0)
+        hl.setSpacing(0)
+        hl.addWidget(scroll)
+        hl.addWidget(self.render_widget, 1)
+        self.setCentralWidget(container)
 
     def _group(self, title: str) -> tuple[QGroupBox, QFormLayout]:
         g = QGroupBox(title)
@@ -302,11 +218,29 @@ class LocalViewer(QMainWindow):
         g.setLayout(f)
         return g, f
 
+    def _progress_bar(self) -> QProgressBar:
+        pb = QProgressBar()
+        pb.setRange(0, 0)
+        pb.setTextVisible(False)
+        pb.setFixedHeight(8)
+        pb.hide()
+        return pb
+
     def _build_controls(self) -> QWidget:
         w   = QWidget()
         vbl = QVBoxLayout(w); vbl.setContentsMargins(4, 4, 4, 4)
+        self._build_culling_group(vbl)
+        self._build_compression_group(vbl)
+        self._build_status_group(vbl)
+        self._build_camera_group(vbl)
+        self._build_resolution_group(vbl)
+        self._build_render_group(vbl)
+        self._build_gaussian_group(vbl)
+        self._build_crop_group(vbl)
+        vbl.addStretch()
+        return w
 
-        # ── Frustum Culling ────────────────────────────────────────────────────
+    def _build_culling_group(self, vbl: QVBoxLayout):
         g, f = self._group("Frustum Culling")
         self._culling_status_label = QLabel()
         self._build_idx_btn = QPushButton()
@@ -316,6 +250,8 @@ class LocalViewer(QMainWindow):
         self._leaf_max_spin.setSingleStep(1000)
         self._leaf_max_spin.setValue(self._leaf_max)
         self._leaf_max_spin.valueChanged.connect(lambda v: setattr(self, '_leaf_max', v))
+        self._culling_progress = self._progress_bar()
+
         if self._no_culling_flag:
             self._culling_status_label.setText("Disabled (--no-culling)")
             self._culling_status_label.setStyleSheet("color: #888888;")
@@ -335,9 +271,26 @@ class LocalViewer(QMainWindow):
             f.addRow("Status:", self._culling_status_label)
             f.addRow("Leaf size:", self._leaf_max_spin)
             f.addRow(self._build_idx_btn)
+        f.addRow(self._culling_progress)
         vbl.addWidget(g)
 
-        # ── Status ─────────────────────────────────────────────────────────────
+    def _build_compression_group(self, vbl: QVBoxLayout):
+        g, f = self._group("Compression")
+        self._compression_combo = NoScrollCombo()
+        self._compression_combo.addItems(_COMPRESSION_LABELS)
+        self._compression_combo.blockSignals(True)
+        self._compression_combo.setCurrentIndex(self._current_compression)
+        self._compression_combo.blockSignals(False)
+        self._compression_combo.currentIndexChanged.connect(self._on_compression_changed)
+        self._compression_status_label = QLabel(f"L{self._current_compression} active")
+        self._compression_status_label.setStyleSheet("color: #66cc66;")
+        self._compress_progress = self._progress_bar()
+        f.addRow("Level:", self._compression_combo)
+        f.addRow("Status:", self._compression_status_label)
+        f.addRow(self._compress_progress)
+        vbl.addWidget(g)
+
+    def _build_status_group(self, vbl: QVBoxLayout):
         g, f = self._group("Status")
         self._fps_label   = QLabel("--")
         self._gpu_label   = QLabel("--")
@@ -355,22 +308,18 @@ class LocalViewer(QMainWindow):
         f.addRow("Overlays:", overlay_row)
         vbl.addWidget(g)
 
-        # ── Camera ─────────────────────────────────────────────────────────────
+    def _build_camera_group(self, vbl: QVBoxLayout):
         g, f = self._group("Camera")
-
         f.addRow("World Up:", combo(UP_AXIS_OPTIONS, self._cfg["world_up"], self._on_world_up_changed))
-
-        f.addRow("FOV:",
-            slider_spin(10, 120, self.fov_deg, self._set_fov))
-
+        f.addRow("FOV:",      slider_spin(10, 120, self.fov_deg, lambda v: self._set("fov_deg", float(v))))
         f.addRow("Move Speed:",
             slider_spin(0.1, 5.0, self._move_speed,
-                         lambda v: setattr(self, '_move_speed', v),
-                         is_float=True, decimals=2, step=0.05))
+                        lambda v: setattr(self, '_move_speed', v),
+                        is_float=True, decimals=2, step=0.05))
         f.addRow("Orbit Speed:",
             slider_spin(0.1, 5.0, self._orbit_speed,
-                         lambda v: setattr(self, '_orbit_speed', v),
-                         is_float=True, decimals=2, step=0.05))
+                        lambda v: setattr(self, '_orbit_speed', v),
+                        is_float=True, decimals=2, step=0.05))
 
         mouse_row = QWidget(); ml = QHBoxLayout(mouse_row); ml.setContentsMargins(0,0,0,0)
         minv_x = QCheckBox("Inv X"); minv_x.setChecked(self._cfg["mouse_inv_x"])
@@ -392,23 +341,20 @@ class LocalViewer(QMainWindow):
         btn_reset.clicked.connect(self._reset_camera)
         f.addRow(btn_reset)
         hint = QLabel("LMB: orbit  |  RMB: pan  |  Scroll: zoom\n"
-                       "WASD: translate  |  Arrows: FPS look  |  R: reset")
+                      "WASD: translate  |  Arrows: FPS look  |  R: reset")
         hint.setWordWrap(True)
         f.addRow(hint)
         vbl.addWidget(g)
 
-        # ── Resolution ─────────────────────────────────────────────────────────
+    def _build_resolution_group(self, vbl: QVBoxLayout):
         g, f = self._group("Resolution")
-
         self._res_width_spin = QSpinBox()
         self._res_width_spin.setRange(2, 7680); self._res_width_spin.setSingleStep(2)
-        self._res_width_spin.setValue(self._render_w)
 
         self._res_height_spin = QSpinBox()
         self._res_height_spin.setRange(2, 4320); self._res_height_spin.setSingleStep(2)
-        self._res_height_spin.setValue(self._render_h)
 
-        self._ar_combo = QComboBox()
+        self._ar_combo = NoScrollCombo()
         self._ar_combo.addItems(AR_RATIO_OPTIONS)
 
         self._ar_custom_spin = QDoubleSpinBox()
@@ -422,10 +368,17 @@ class LocalViewer(QMainWindow):
         self._lock_ar_cb.setChecked(self._lock_ar)
         self._lock_ar_cb.toggled.connect(lambda v: setattr(self, '_lock_ar', v))
 
-        preset_combo = QComboBox()
+        preset_combo = NoScrollCombo()
         preset_combo.addItems(list(RESOLUTION_PRESETS.keys()))
         preset_combo.currentTextChanged.connect(self._on_preset_changed)
-        preset_combo.setCurrentText("720p (HD)")
+        _preset = next(
+            (name for name, wh in RESOLUTION_PRESETS.items()
+             if wh is not None and wh == (self._render_w, self._render_h)),
+            "Custom"
+        )
+        preset_combo.blockSignals(True)
+        preset_combo.setCurrentText(_preset)
+        preset_combo.blockSignals(False)
 
         for spin, val in [(self._res_width_spin, self._render_w),
                           (self._res_height_spin, self._render_h)]:
@@ -437,9 +390,12 @@ class LocalViewer(QMainWindow):
         self._ar_custom_spin.valueChanged.connect(self._on_ar_custom_changed)
         self._ar_combo.setCurrentText(self._cfg["ar_preset"])
 
+        wh_row = QWidget(); wl = QHBoxLayout(wh_row); wl.setContentsMargins(0, 0, 0, 0)
+        wl.addWidget(self._res_width_spin)
+        wl.addWidget(QLabel("×"))
+        wl.addWidget(self._res_height_spin)
         f.addRow("Preset:", preset_combo)
-        f.addRow("Width:",  self._res_width_spin)
-        f.addRow("Height:", self._res_height_spin)
+        f.addRow("Size:", wh_row)
         ar_row = QWidget(); al = QHBoxLayout(ar_row); al.setContentsMargins(0,0,0,0)
         al.addWidget(self._ar_combo, 2)
         al.addWidget(self._ar_custom_spin, 1)
@@ -447,7 +403,7 @@ class LocalViewer(QMainWindow):
         f.addRow("Aspect:", ar_row)
         vbl.addWidget(g)
 
-        # ── Render Options ──────────────────────────────────────────────────────
+    def _build_render_group(self, vbl: QVBoxLayout):
         g, f = self._group("Render Options")
         f.addRow("Type:", combo(RENDER_TYPES, self.render_type,
             lambda v: self._set("render_type", v)))
@@ -469,12 +425,13 @@ class LocalViewer(QMainWindow):
             lambda v: self._set("render_type2", v)))
         vbl.addWidget(g)
 
-        # ── Gaussian Model ──────────────────────────────────────────────────────
+    def _build_gaussian_group(self, vbl: QVBoxLayout):
         g, f = self._group("Gaussian Model")
-        if self._max_sh > 0:
-            f.addRow("SH Degree:",
-                slider_spin(0, self._max_sh, self.sh_degree,
-                    lambda v: self._set("sh_degree", int(v))))
+        self._sh_spin = QSpinBox()
+        self._sh_spin.setRange(0, self._ply_sh_degree)
+        self._sh_spin.setValue(self.sh_degree)
+        self._sh_spin.valueChanged.connect(lambda v: self._set("sh_degree", v))
+        f.addRow("SH Degree:", self._sh_spin)
         f.addRow("Opacity Thr:",
             slider_spin(0.0, 0.5, self.opacity_thresh,
                 lambda v: self._set("opacity_thresh", v),
@@ -500,7 +457,7 @@ class LocalViewer(QMainWindow):
                 is_float=True, decimals=3, step=0.001))
         vbl.addWidget(g)
 
-        # ── Crop Box ────────────────────────────────────────────────────────────
+    def _build_crop_group(self, vbl: QVBoxLayout):
         g, f = self._group("Crop Box")
         crop_cb = QCheckBox()
         crop_cb.setChecked(self.crop_enabled)
@@ -518,9 +475,6 @@ class LocalViewer(QMainWindow):
                     is_float=True, decimals=1, step=0.1))
         vbl.addWidget(g)
 
-        vbl.addStretch()
-        return w
-
     # ── Frustum culling build ──────────────────────────────────────────────────
 
     def _on_build_index(self):
@@ -528,11 +482,11 @@ class LocalViewer(QMainWindow):
         self._build_idx_btn.setText("Building...")
         self._culling_status_label.setText("Building index...")
         self._culling_status_label.setStyleSheet("color: #aaaaaa;")
+        self._culling_progress.show()
         threading.Thread(target=self._build_index_worker, daemon=True).start()
 
     def _build_index_worker(self):
         from build_index import build_octree, read_xyz
-        import numpy as _np
         try:
             idx_path = _idx_path(self.ply_path)
             os.makedirs(os.path.dirname(idx_path), exist_ok=True)
@@ -543,9 +497,9 @@ class LocalViewer(QMainWindow):
                 xyz, leaf_max=self._leaf_max)
             print(f"[viewer]   Done in {time.perf_counter()-t0:.1f}s — saving to {idx_path}")
             with open(idx_path, "wb") as fh:
-                _np.savez_compressed(fh, node_aabbs=node_aabbs,
-                                      node_offsets=node_offsets,
-                                      flat_indices=flat_indices)
+                np.savez_compressed(fh, node_aabbs=node_aabbs,
+                                    node_offsets=node_offsets,
+                                    flat_indices=flat_indices)
             self._octree_pending = {"node_aabbs":   node_aabbs,
                                     "node_offsets": node_offsets,
                                     "flat_indices": flat_indices}
@@ -560,8 +514,63 @@ class LocalViewer(QMainWindow):
         self._culling_status_label.setStyleSheet("color: #66cc66;")
         self._build_idx_btn.setEnabled(True)
         self._build_idx_btn.setText("Rebuild Index")
+        self._culling_progress.hide()
         self.render_widget._no_culling_warning = False
         self.render_widget.update()
+
+    # ── Compression ────────────────────────────────────────────────────────────
+
+    def _on_compression_changed(self, index: int):
+        if index == self._current_compression:
+            return
+        self._compression_combo.setEnabled(False)
+        label = _COMPRESSION_LABELS[index]
+        action = "Loading" if index == 0 or os.path.exists(
+            _compressed_ply_path(self.ply_path, index)) else "Compressing"
+        self._compression_status_label.setText(f"{action} {label.split(' — ')[0]}...")
+        self._compression_status_label.setStyleSheet("color: #aaaaaa;")
+        self._compress_progress.show()
+        threading.Thread(target=self._compression_worker,
+                         args=(index,), daemon=True).start()
+
+    def _compression_worker(self, level: int):
+        try:
+            if level == 0:
+                src_path = self.ply_path
+            else:
+                src_path = _compressed_ply_path(self.ply_path, level)
+                if not os.path.exists(src_path):
+                    from utils.compress import compress_level1, compress_level2, compress_level3
+                    from plyfile import PlyData as _PlyData
+                    t0 = time.perf_counter()
+                    print(f"[viewer] Compressing to L{level}: {src_path}")
+                    original = _PlyData.read(self.ply_path)
+                    if   level == 1: compressed = compress_level1(original)
+                    elif level == 2: compressed = compress_level2(original)
+                    elif level == 3: compressed = compress_level3(original)
+                    os.makedirs(os.path.dirname(src_path), exist_ok=True)
+                    compressed.write(src_path)
+                    print(f"[viewer]   Saved in {time.perf_counter()-t0:.1f}s: {src_path}")
+
+            arrays = _read_ply_numpy(src_path)
+            self._ply_pending = (arrays, level)
+            self._render_trig.set()
+        except Exception:
+            import traceback; traceback.print_exc()
+            self._compress_error_flag = True
+
+    def _on_ply_loaded(self, level: int):
+        self._current_compression = level
+        self.sh_degree = self._ply_sh_degree           # always reset to new max
+        self._sh_spin.setMaximum(self._ply_sh_degree)
+        self._sh_spin.setValue(self._ply_sh_degree)
+        self._compression_status_label.setText(f"L{level} active")
+        self._compression_status_label.setStyleSheet("color: #66cc66;")
+        self._compression_combo.setEnabled(True)
+        self._compression_combo.blockSignals(True)
+        self._compression_combo.setCurrentIndex(level)
+        self._compression_combo.blockSignals(False)
+        self._compress_progress.hide()
 
     # ── Settings helpers ───────────────────────────────────────────────────────
 
@@ -569,15 +578,8 @@ class LocalViewer(QMainWindow):
         setattr(self, attr, val)
         self._render_trig.set()
 
-    def _set_fov(self, val: float):
-        self.fov_deg = float(val)
-        self._render_trig.set()
-
     def _set_crop(self, attr: str, idx: int, val: float):
         getattr(self, attr)[idx] = val
-        self._render_trig.set()
-
-    def _on_camera_change(self):
         self._render_trig.set()
 
     def _reset_camera(self):
@@ -700,9 +702,8 @@ class LocalViewer(QMainWindow):
         if Qt.Key_S in k: fwd_d   -= move_speed
         if Qt.Key_A in k: right_d -= move_speed
         if Qt.Key_D in k: right_d += move_speed
-
-        if Qt.Key_E in k: up_d += move_speed
-        if Qt.Key_Q in k: up_d -= move_speed
+        if Qt.Key_E in k: up_d    += move_speed
+        if Qt.Key_Q in k: up_d    -= move_speed
 
         if Qt.Key_Left  in k: dyaw   -= orbit_speed
         if Qt.Key_Right in k: dyaw   += orbit_speed
@@ -743,9 +744,6 @@ class LocalViewer(QMainWindow):
 
     # ── Render thread ──────────────────────────────────────────────────────────
 
-    def _start_render_thread(self):
-        threading.Thread(target=self._render_loop, daemon=True).start()
-
     def _render_loop(self):
         while self._running:
             self._render_trig.wait(timeout=0.2)
@@ -762,6 +760,19 @@ class LocalViewer(QMainWindow):
                 self.renderer.update_pc_features()
                 self._culling_enabled_flag = True
 
+            ply_pending = self._ply_pending
+            if ply_pending is not None:
+                self._ply_pending = None
+                arrays, level = ply_pending
+                _install_numpy_into_model(self.renderer.gaussian_model, arrays)
+                self.renderer._spatially_ordered = False
+                self.renderer.culling_enabled = (
+                    self.renderer.octree is not None and not self._no_culling_flag
+                )
+                self.renderer.update_pc_features()
+                self._ply_sh_degree    = arrays["active_sh_degree"]
+                self._ply_loaded_level = level
+
             W = max(self._render_w, 2)
             H = max(self._render_h, 2)
             valid_range = (self.crop_x, self.crop_y, self.crop_z) if self.crop_enabled else None
@@ -775,7 +786,7 @@ class LocalViewer(QMainWindow):
                         valid_range       = valid_range,
                         split             = self.split_enabled,
                         slider            = self.split_pos,
-                        active_sh_degree  = self.sh_degree,
+                        active_sh_degree  = min(self.sh_degree, self._ply_sh_degree),
                         scaling_modifier  = self.scaling_mod,
                         sparsity          = self.sparsity,
                         opacity_threshold = self.opacity_thresh,
@@ -816,6 +827,20 @@ class LocalViewer(QMainWindow):
             self._culling_status_label.setStyleSheet("color: #ff4444;")
             self._build_idx_btn.setEnabled(True)
             self._build_idx_btn.setText("Retry Build")
+            self._culling_progress.hide()
+        lvl = self._ply_loaded_level
+        if lvl is not None:
+            self._ply_loaded_level = None
+            self._on_ply_loaded(lvl)
+        if self._compress_error_flag:
+            self._compress_error_flag = False
+            self._compression_status_label.setText("Failed — see console")
+            self._compression_status_label.setStyleSheet("color: #ff4444;")
+            self._compression_combo.blockSignals(True)
+            self._compression_combo.setCurrentIndex(self._current_compression)
+            self._compression_combo.blockSignals(False)
+            self._compression_combo.setEnabled(True)
+            self._compress_progress.hide()
 
         with self._frame_lock:
             slot = self._frame_slot
@@ -837,40 +862,60 @@ class LocalViewer(QMainWindow):
     def closeEvent(self, e):
         self._running = False
         self._render_trig.set()
+        _up_key = next((k for k, v in UP_AXIS_VECTORS.items()
+                        if np.allclose(v, self.camera.world_up)), "+Z")
         self._cfg.update({
-            "fov_deg":           self.fov_deg,
-            "move_speed":        self._move_speed,
-            "orbit_speed":       self._orbit_speed,
-            "mouse_inv_x":       self.render_widget.mouse_inv_x,
-            "mouse_inv_y":       self.render_widget.mouse_inv_y,
-            "kb_inv_x":          self._kb_inv_x,
-            "kb_inv_y":          self._kb_inv_y,
-            "world_up":          next((k for k, v in UP_AXIS_VECTORS.items()
-                                       if np.allclose(v, self.camera.world_up)), "+Z"),
-            "render_w":          self._render_w,
-            "render_h":          self._render_h,
-            "ar_preset":         self._ar_combo.currentText(),
-            "lock_ar":           self._lock_ar,
-            "depth_ratio":       self.depth_ratio,
-            "active_sh_degree":  self.sh_degree,
-            "opacity_thresh":    self.opacity_thresh,
-            "sparsity":          self.sparsity,
-            "scaling_mod":       self.scaling_mod,
-            "point_size":        self.point_size,
-            "render_type":       self.render_type,
-            "show_fps_overlay":  self.render_widget._show_fps_overlay,
+            "fov_deg":            self.fov_deg,
+            "move_speed":         self._move_speed,
+            "orbit_speed":        self._orbit_speed,
+            "mouse_inv_x":        self.render_widget.mouse_inv_x,
+            "mouse_inv_y":        self.render_widget.mouse_inv_y,
+            "kb_inv_x":           self._kb_inv_x,
+            "kb_inv_y":           self._kb_inv_y,
+            "world_up":           _up_key,
+            "render_w":           self._render_w,
+            "render_h":           self._render_h,
+            "ar_preset":          self._ar_combo.currentText(),
+            "lock_ar":            self._lock_ar,
+            "depth_ratio":        self.depth_ratio,
+            "active_sh_degree":   self.sh_degree,
+            "opacity_thresh":     self.opacity_thresh,
+            "sparsity":           self.sparsity,
+            "scaling_mod":        self.scaling_mod,
+            "point_size":         self.point_size,
+            "render_type":        self.render_type,
+            "show_fps_overlay":   self.render_widget._show_fps_overlay,
             "show_splat_overlay": self.render_widget._show_splat_overlay,
         })
         save_config(self._cfg)
+        # Per-model config: global settings + camera pose + model-specific state
+        save_model_config(self.ply_path, {
+            **self._cfg,
+            "camera_look_at":   self.camera.look_at.tolist(),
+            "camera_distance":  float(self.camera.distance),
+            "camera_yaw":       float(self.camera.yaw),
+            "camera_pitch":     float(self.camera.pitch),
+            "compression":      self._current_compression,
+            "render_type1":     self.render_type1,
+            "render_type2":     self.render_type2,
+            "split_enabled":    self.split_enabled,
+            "split_pos":        float(self.split_pos),
+            "show_ptc":         self.show_ptc,
+            "surfel_disk":      self.surfel_disk,
+            "crop_enabled":     self.crop_enabled,
+            "crop_x":           list(self.crop_x),
+            "crop_y":           list(self.crop_y),
+            "crop_z":           list(self.crop_z),
+        })
         super().closeEvent(e)
 
 
-# ── Entry points ───────────────────────────────────────────────────────────────
+# ── Entry point ────────────────────────────────────────────────────────────────
 
 def run_local_viewer(ply_path: str, args) -> None:
     """Launch the Qt GUI. Called from main.py or directly."""
     app = QApplication.instance() or QApplication(sys.argv)
-    QLocale.setDefault(QLocale(QLocale.C))   # force dot as decimal separator
+    QLocale.setDefault(QLocale(QLocale.C))
     app.setStyle("Fusion")
     viewer = LocalViewer(ply_path, args)
     viewer.show()

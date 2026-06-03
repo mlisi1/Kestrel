@@ -64,7 +64,7 @@ _DEFAULT_W, _DEFAULT_H = 1280, 720
 
 # ── Persistent config ─────────────────────────────────────────────────────────
 
-CONFIG_PATH = pathlib.Path.home() / ".config" / "2dgs_viewer" / "config.json"
+CONFIG_PATH = pathlib.Path.home() / ".config" / "kestrel" / "config.json"
 
 CONFIG_DEFAULTS: dict = {
     "fov_deg":            60.0,

@@ -8,6 +8,12 @@ from PyQt5.QtWidgets import (
 )
 
 
+class NoScrollCombo(QComboBox):
+    """QComboBox that ignores scroll-wheel events to prevent accidental value changes."""
+    def wheelEvent(self, e):
+        e.ignore()
+
+
 def slider_spin(mn: float, mx: float, val: float, on_change,
                 is_float: bool = False,
                 decimals: int = 2,
@@ -78,8 +84,8 @@ def slider_spin(mn: float, mx: float, val: float, on_change,
     return row
 
 
-def combo(items, current, on_change) -> QComboBox:
-    c = QComboBox()
+def combo(items, current, on_change) -> NoScrollCombo:
+    c = NoScrollCombo()
     c.addItems(items)
     c.setCurrentText(current)
     c.currentTextChanged.connect(on_change)

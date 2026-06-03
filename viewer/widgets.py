@@ -17,7 +17,7 @@ from viewer.config import fmt_splats
 
 class RenderWidget(QLabel):
     """
-    Displays the rendered 2DGS frame and handles all mouse/keyboard events
+    Displays the rendered Kestrel frame and handles all mouse/keyboard events
     for camera navigation.
 
     Signals
