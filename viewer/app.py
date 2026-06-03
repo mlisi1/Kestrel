@@ -12,6 +12,7 @@ import numpy as np
 import torch
 
 from PyQt5.QtCore    import Qt, QLocale, QTimer
+from PyQt5.QtGui     import QIcon
 from PyQt5.QtWidgets import (
     QApplication, QHBoxLayout, QMainWindow, QScrollArea, QWidget,
 )
@@ -31,6 +32,7 @@ from viewer.config        import (
 from viewer.camera        import OrbitCamera
 from viewer.widgets       import RenderWidget
 from viewer.sidebar       import Sidebar
+from viewer.dialogs       import HelpMenu
 from viewer.ply_loader    import (
     _detect_sh_degree, _idx_path, _compressed_ply_path, _load_octree,
     _load_ply_into_model, _read_ply_numpy, _install_numpy_into_model,
@@ -175,6 +177,8 @@ class LocalViewer(QMainWindow):
     def _build_ui(self):
         self.setWindowTitle("Kestrel")
         self.resize(1640, 900)
+        self.setWindowIcon(QIcon(os.path.join(_ROOT, "res", "kestrel_icon.png")))
+        HelpMenu(self)
 
         self.render_widget = RenderWidget(self.camera)
         self.render_widget.mouse_inv_x         = self._cfg["mouse_inv_x"]
@@ -199,6 +203,7 @@ class LocalViewer(QMainWindow):
         hl.addWidget(scroll)
         hl.addWidget(self.render_widget, 1)
         self.setCentralWidget(container)
+
 
     # ── Settings helpers ───────────────────────────────────────────────────────
 
@@ -511,6 +516,7 @@ def run_local_viewer(ply_path: str, args) -> None:
     app = QApplication.instance() or QApplication(sys.argv)
     QLocale.setDefault(QLocale(QLocale.C))
     app.setStyle("Fusion")
+    app.setWindowIcon(QIcon(os.path.join(_ROOT, "res", "kestrel_icon.png")))
     viewer = LocalViewer(ply_path, args)
     viewer.show()
     sys.exit(app.exec_())
