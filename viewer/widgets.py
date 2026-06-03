@@ -41,6 +41,7 @@ class RenderWidget(QLabel):
         self._splat_history    = collections.deque(maxlen=90)
         self._show_fps_overlay   = True
         self._show_splat_overlay = True
+        self._no_culling_warning = False
         self.setAlignment(Qt.AlignCenter)
         self.setMinimumSize(640, 360)
         self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
@@ -117,6 +118,10 @@ class RenderWidget(QLabel):
             p = QPainter(self)
             h_fps = 90 + 4 if (self._show_fps_overlay and self._fps_history) else 0
             self._draw_splat_overlay(p, y_offset=h_fps)
+            p.end()
+        if self._no_culling_warning:
+            p = QPainter(self)
+            self._draw_culling_warning(p)
             p.end()
 
     def _draw_fps_overlay(self, p: QPainter):
@@ -245,3 +250,25 @@ class RenderWidget(QLabel):
         p.setPen(QColor(255, 255, 255, 230))
         p.drawText(QRectF(float(ox), float(oy) + 1.0, float(W_OV), float(PAD_T) - 2.0),
                    Qt.AlignCenter, f"{fmt_splats(current_n)} splats")
+
+    def _draw_culling_warning(self, p: QPainter):
+        MARGIN = 8
+        PAD_X, PAD_Y = 8, 4
+        p.setRenderHint(QPainter.Antialiasing)
+        font = QFont()
+        font.setPointSize(8)
+        font.setBold(True)
+        p.setFont(font)
+        text = "No culling index  —  frustum culling disabled"
+        fm = p.fontMetrics()
+        tw = fm.horizontalAdvance(text)
+        th = fm.height()
+        bw = tw + PAD_X * 2
+        bh = th + PAD_Y * 2
+        p.setPen(Qt.NoPen)
+        p.setBrush(QColor(180, 100, 0, 210))
+        p.drawRoundedRect(MARGIN, MARGIN, bw, bh, 4, 4)
+        p.setPen(QColor(255, 255, 255, 230))
+        p.drawText(QRectF(float(MARGIN + PAD_X), float(MARGIN),
+                          float(tw), float(bh)),
+                   Qt.AlignVCenter, text)

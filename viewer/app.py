@@ -52,9 +52,16 @@ def _detect_sh_degree(path: str) -> int:
     raise ValueError(f"Cannot determine SH degree: {n_rest} f_rest_ properties in {path}")
 
 
+def _idx_path(ply_path: str) -> str:
+    """<iteration_dir>/.kestrel/<ply_stem>.idx"""
+    iteration_dir = os.path.dirname(os.path.abspath(ply_path))
+    stem = os.path.splitext(os.path.basename(ply_path))[0]
+    return os.path.join(iteration_dir, ".kestrel", stem + ".idx")
+
+
 def _load_octree(ply_path: str) -> dict | None:
     import numpy as _np
-    idx_path = os.path.splitext(ply_path)[0] + ".idx"
+    idx_path = _idx_path(ply_path)
     if not os.path.exists(idx_path):
         print(f"[viewer] No octree index found at {idx_path} — frustum culling disabled")
         return None
@@ -140,9 +147,11 @@ class LocalViewer(QMainWindow):
 
     def __init__(self, ply_path: str, args):
         super().__init__()
-        self.device   = torch.device("cuda")
-        self.ply_path = ply_path
-        self.cam_tf   = torch.eye(4, dtype=torch.float64)
+        self.device          = torch.device("cuda")
+        self.ply_path        = ply_path
+        self._leaf_max       = getattr(args, 'leaf_max', 5000)
+        self._no_culling_flag = getattr(args, 'no_culling', False)
+        self.cam_tf          = torch.eye(4, dtype=torch.float64)
 
         # Config (loaded before model so defaults are available everywhere)
         self._cfg = load_config()
@@ -157,7 +166,8 @@ class LocalViewer(QMainWindow):
         if getattr(args, 'build_index', False):
             from build_index import build_octree, read_xyz
             import numpy as _np
-            idx_path = os.path.splitext(ply_path)[0] + ".idx"
+            idx_path = _idx_path(ply_path)
+            os.makedirs(os.path.dirname(idx_path), exist_ok=True)
             leaf_max = getattr(args, 'leaf_max', 5000)
             print(f"[viewer] Building octree index (leaf_max={leaf_max:,}) ...")
             t0 = time.perf_counter()
@@ -235,7 +245,15 @@ class LocalViewer(QMainWindow):
         self._render_trig = threading.Event()
         self._running     = True
 
+        # Background index build state (written by worker thread, read by render/poll threads)
+        self._octree_pending       = None   # set to dict when build finishes
+        self._culling_enabled_flag = False  # set True by render loop after octree install
+        self._build_error_flag     = False  # set True by worker on failure
+
         self._build_ui()
+
+        if not self._no_culling_flag and self.renderer.octree is None:
+            self.render_widget._no_culling_warning = True
         self._start_render_thread()
 
         self._poll_timer = QTimer()
@@ -287,6 +305,37 @@ class LocalViewer(QMainWindow):
     def _build_controls(self) -> QWidget:
         w   = QWidget()
         vbl = QVBoxLayout(w); vbl.setContentsMargins(4, 4, 4, 4)
+
+        # ── Frustum Culling ────────────────────────────────────────────────────
+        g, f = self._group("Frustum Culling")
+        self._culling_status_label = QLabel()
+        self._build_idx_btn = QPushButton()
+        self._build_idx_btn.clicked.connect(self._on_build_index)
+        self._leaf_max_spin = QSpinBox()
+        self._leaf_max_spin.setRange(100, 1_000_000)
+        self._leaf_max_spin.setSingleStep(1000)
+        self._leaf_max_spin.setValue(self._leaf_max)
+        self._leaf_max_spin.valueChanged.connect(lambda v: setattr(self, '_leaf_max', v))
+        if self._no_culling_flag:
+            self._culling_status_label.setText("Disabled (--no-culling)")
+            self._culling_status_label.setStyleSheet("color: #888888;")
+            f.addRow("Status:", self._culling_status_label)
+        elif self.renderer.octree is not None:
+            n = len(self.renderer.octree["node_aabbs"])
+            self._culling_status_label.setText(f"Active — {n:,} leaves")
+            self._culling_status_label.setStyleSheet("color: #66cc66;")
+            self._build_idx_btn.setText("Rebuild Index")
+            f.addRow("Status:", self._culling_status_label)
+            f.addRow("Leaf size:", self._leaf_max_spin)
+            f.addRow(self._build_idx_btn)
+        else:
+            self._culling_status_label.setText("No index — culling disabled")
+            self._culling_status_label.setStyleSheet("color: #ff9900;")
+            self._build_idx_btn.setText("Build Index")
+            f.addRow("Status:", self._culling_status_label)
+            f.addRow("Leaf size:", self._leaf_max_spin)
+            f.addRow(self._build_idx_btn)
+        vbl.addWidget(g)
 
         # ── Status ─────────────────────────────────────────────────────────────
         g, f = self._group("Status")
@@ -471,6 +520,48 @@ class LocalViewer(QMainWindow):
 
         vbl.addStretch()
         return w
+
+    # ── Frustum culling build ──────────────────────────────────────────────────
+
+    def _on_build_index(self):
+        self._build_idx_btn.setEnabled(False)
+        self._build_idx_btn.setText("Building...")
+        self._culling_status_label.setText("Building index...")
+        self._culling_status_label.setStyleSheet("color: #aaaaaa;")
+        threading.Thread(target=self._build_index_worker, daemon=True).start()
+
+    def _build_index_worker(self):
+        from build_index import build_octree, read_xyz
+        import numpy as _np
+        try:
+            idx_path = _idx_path(self.ply_path)
+            os.makedirs(os.path.dirname(idx_path), exist_ok=True)
+            t0 = time.perf_counter()
+            print(f"[viewer] Building octree index (leaf_max={self._leaf_max:,}) ...")
+            xyz = read_xyz(self.ply_path)
+            node_aabbs, node_offsets, flat_indices = build_octree(
+                xyz, leaf_max=self._leaf_max)
+            print(f"[viewer]   Done in {time.perf_counter()-t0:.1f}s — saving to {idx_path}")
+            with open(idx_path, "wb") as fh:
+                _np.savez_compressed(fh, node_aabbs=node_aabbs,
+                                      node_offsets=node_offsets,
+                                      flat_indices=flat_indices)
+            self._octree_pending = {"node_aabbs":   node_aabbs,
+                                    "node_offsets": node_offsets,
+                                    "flat_indices": flat_indices}
+            self._render_trig.set()
+        except Exception:
+            import traceback; traceback.print_exc()
+            self._build_error_flag = True
+
+    def _on_culling_ready(self):
+        n = len(self.renderer.octree["node_aabbs"])
+        self._culling_status_label.setText(f"Active — {n:,} leaves")
+        self._culling_status_label.setStyleSheet("color: #66cc66;")
+        self._build_idx_btn.setEnabled(True)
+        self._build_idx_btn.setText("Rebuild Index")
+        self.render_widget._no_culling_warning = False
+        self.render_widget.update()
 
     # ── Settings helpers ───────────────────────────────────────────────────────
 
@@ -662,6 +753,15 @@ class LocalViewer(QMainWindow):
             if not self._running:
                 break
 
+            pending = self._octree_pending
+            if pending is not None:
+                self._octree_pending = None
+                self.renderer.octree = pending
+                self.renderer._spatially_ordered = False
+                self.renderer.culling_enabled = True
+                self.renderer.update_pc_features()
+                self._culling_enabled_flag = True
+
             W = max(self._render_w, 2)
             H = max(self._render_h, 2)
             valid_range = (self.crop_x, self.crop_y, self.crop_z) if self.crop_enabled else None
@@ -707,6 +807,16 @@ class LocalViewer(QMainWindow):
     # ── Frame polling ──────────────────────────────────────────────────────────
 
     def _poll_frame(self):
+        if self._culling_enabled_flag:
+            self._culling_enabled_flag = False
+            self._on_culling_ready()
+        if self._build_error_flag:
+            self._build_error_flag = False
+            self._culling_status_label.setText("Build failed — see console")
+            self._culling_status_label.setStyleSheet("color: #ff4444;")
+            self._build_idx_btn.setEnabled(True)
+            self._build_idx_btn.setText("Retry Build")
+
         with self._frame_lock:
             slot = self._frame_slot
             self._frame_slot = None
