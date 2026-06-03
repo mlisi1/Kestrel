@@ -1,0 +1,12 @@
+# Core
+torch
+numpy
+matplotlib
+plyfile
+
+# Qt viewer
+PyQt5
+
+# CUDA extensions (build from submodule source)
+# pip install -e 2d_gaussian_splatting/submodules/diff-surfel-rasterization
+# pip install -e 2d_gaussian_splatting/submodules/simple-knn
