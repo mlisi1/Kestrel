@@ -359,7 +359,6 @@ class LocalViewer(QMainWindow):
             if pending is not None:
                 self._octree_pending = None
                 self.renderer.octree = pending
-                self.renderer._update_node_aabbs_gpu()
                 self.renderer._spatially_ordered = False
                 self.renderer.culling_enabled = True
                 self.renderer.update_pc_features()

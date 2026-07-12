@@ -1,32 +1,42 @@
-"""ViewerRenderer: GPU render pipeline for 2D Gaussian Splatting scenes.
+"""ViewerRenderer: Kestrel's thin GUI-facing wrapper around
+gsplat2d_rendering.SplatRenderer.
 
-Kept as Kestrel's own render path (rather than gsplat2d_rendering's
-SplatRenderer/Renderer facade) because it supports render types and display
-modes the library doesn't expose yet (normal/alpha/distortion maps,
-point-cloud/disk display, crop box, sparsity, a live opacity-threshold
-slider) — see docs/gsplat2d-rendering-gap.md for the plan to fold this back
-into the library. Model loading, camera construction, octree building,
-per-frame profiling, SH evaluation, and depth-to-normal all go through
-gsplat2d_rendering; only the rasterization call itself stays local. Kestrel
-no longer depends on the 2d_gaussian_splatting submodule at all —
-diff_surfel_rasterization resolves via the globally pip-installed package
-built from gsplat2d-rendering's own vendored copy.
+All actual rendering work — culling, LOD, candidate filters (sparsity/crop
+box/opacity threshold), render mode (gaussian/point/disk), depth-ratio
+blending, and per-frame profiling — is delegated to the library. This class
+only owns:
+
+  - rebuilding SplatRenderer when the model/octree/culling_enabled change
+    (those are constructor-only on SplatRenderer, not mutable afterward —
+    see gsplat2d_rendering/render/rasterizer.py)
+  - applying Kestrel's per-frame SH-degree cap by mutating
+    `gaussian_model.active_sh_degree` in place before each render() call —
+    there's no per-call override on SplatRenderer.render() for this
+  - turning RenderOutput's raw GPU tensors into the specific display image
+    Kestrel's render_type dropdown asks for (turbo colormap for
+    alpha/depth/distortion, world-space normal rotation, depth-to-normal/
+    curvature via gsplat2d_rendering.depth_to_normal, split-view
+    compositing) — all "how do I look at this" concerns the library
+    deliberately leaves to callers.
+
+Known gap: Kestrel's "Scale" slider (global splat-size multiplier) has no
+effect right now. `SplatRenderer.render()` hardcodes the rasterizer's
+`scale_modifier` to 1.0 instead of exposing it as a parameter — that field
+is a genuine, already-wired CUDA kernel parameter (see
+diff_surfel_rasterization.GaussianRasterizationSettings), so this is a
+trivial library-side pass-through fix, not something worth working around
+here with an O(N) per-frame scale-tensor rewrite.
 """
-
-import math
+from __future__ import annotations
 
 import matplotlib.pyplot as plt
-import numpy as np
 import torch
 import torch.nn.functional as F
-from diff_surfel_rasterization import GaussianRasterizationSettings, GaussianRasterizer
 
-from gsplat2d_rendering.render.profiling import Profiler
-from gsplat2d_rendering.render.depth_normal import depth_to_normal
-from gsplat2d_rendering.sh import C0 as SH_C0, eval_sh
+import gsplat2d_rendering as gs2d
+from gsplat2d_rendering.render import SplatRenderer
 
 from renderer.helpers import gradient_map
-from renderer.culling import frustum_cull_mask
 
 
 class ViewerRenderer:
@@ -51,48 +61,82 @@ class ViewerRenderer:
         culling_enabled
             Set False to bypass culling even when an octree is present.
         profiling_enabled
-            Print GPU timing (A:sh / B:raster / C:post) every
+            Print a per-stage GPU timing breakdown every
             *profiling_print_every* frames after *profiling_warmup* warmup frames.
         """
-        super().__init__()
-        self.gaussian_model   = gaussian_model
-        self.background_color = background_color
-        self.clm_colors       = torch.tensor(plt.cm.get_cmap("turbo").colors, device="cuda")
+        self.gaussian_model     = gaussian_model
+        self.background_color   = background_color
+        self.octree              = octree
+        self.culling_enabled     = culling_enabled
+        self._spatially_ordered  = False
+        # Captured once per model (before any per-frame active_sh_degree
+        # mutation below) — the ceiling the sidebar's SH Degree spinbox caps
+        # against.
+        self._max_sh_degree      = gaussian_model.active_sh_degree
+        self.clm_colors          = torch.tensor(plt.cm.get_cmap("turbo").colors, device="cuda")
 
-        # Frustum-culling state
-        self.octree             = octree
-        self.culling_enabled    = culling_enabled
-        self._spatially_ordered = False
-        self._node_aabbs_gpu    = None
-        self._update_node_aabbs_gpu()
+        self._prof_warmup        = profiling_warmup
+        self._prof_print_every   = profiling_print_every
+        self._prof_frame_count   = 0
+        self._profiling_wanted   = profiling_enabled
 
-        # Profiling state — gsplat2d_rendering's own stage-timing collector
-        # (see render/profiling.py). Stats accumulate in the Profiler itself
-        # (mean/min/max/count per stage) rather than a Kestrel-side history
-        # list; _record_profile below prints + resets it every
-        # profiling_print_every frames, so each printed block is a fresh
-        # window rather than an all-time running average.
-        self.profiler               = Profiler(sync_fn=torch.cuda.synchronize)
-        self.profiling_enabled      = profiling_enabled
-        if profiling_enabled:
-            self.profiler.enable()
-        self._prof_warmup           = profiling_warmup
-        self._prof_print_every      = profiling_print_every
-        self._prof_frame_count      = 0
+        # Exposed after each get_outputs() call
+        self.last_visible_count  = 0
 
-        # Exposed after each render_viewer() call
-        self.last_visible_count    = 0
-
+        self._splat_renderer: SplatRenderer | None = None
         if do_initialize:
             self.update_pc_features()
+        else:
+            self._rebuild_splat_renderer()
 
         self._log_startup()
 
-    def _update_node_aabbs_gpu(self):
-        if self.octree is not None:
-            self._node_aabbs_gpu = torch.from_numpy(self.octree.node_aabbs).cuda()
-        else:
-            self._node_aabbs_gpu = None
+    # ── model / octree wiring ─────────────────────────────────────────────────
+
+    def update_pc_features(self):
+        """Reorders the model into the octree's leaf-contiguous order
+        (SplatRenderer's own precondition — see its class docstring) and
+        (re)builds the underlying SplatRenderer. Called whenever the model
+        or octree changes (new PLY installed, compression level switched,
+        background index build finished)."""
+        if self.octree is not None and not self._spatially_ordered:
+            perm = torch.from_numpy(
+                self.octree.flat_indices.astype("int64")
+            ).to(self.gaussian_model.xyz.device)
+            self.gaussian_model.reorder_(perm)
+            del perm
+            self._spatially_ordered = True
+            print(f"[viewer] Spatial reorder : {self.gaussian_model.num_points:,} "
+                  f"splats sorted by octree leaf")
+        self._max_sh_degree = self.gaussian_model.active_sh_degree
+        self._rebuild_splat_renderer()
+
+    def _rebuild_splat_renderer(self):
+        """SplatRenderer's octree/culling_enabled/with_extras are
+        constructor-only, so swapping the octree (background index build) or
+        toggling culling means building a fresh instance — profiler state
+        resets with it, same as switching models. `with_extras=True`
+        unconditionally: the kernel computes alpha/normal/middepth/
+        distortion every frame regardless (see rasterizer.py's module
+        docstring) — the only real cost is a few extra small GPU tensors
+        staying alive between frames, negligible next to the splat model
+        itself, and it's what lets render_type switch live without a rebuild."""
+        was_enabled = (self._splat_renderer.profiler.enabled
+                       if self._splat_renderer is not None else self._profiling_wanted)
+        self._splat_renderer = SplatRenderer(
+            self.gaussian_model,
+            octree=self.octree,
+            culling_enabled=self.culling_enabled,
+            with_extras=True,
+        )
+        # Not exposed as a constructor/render() param on SplatRenderer —
+        # background is a plain mutable instance attribute there, so this is
+        # a supported way to override its (otherwise hardcoded black) default.
+        self._splat_renderer.background = self.background_color
+        self.profiler = self._splat_renderer.profiler
+        self._prof_frame_count = 0
+        if was_enabled:
+            self._splat_renderer.enable_profiling()
 
     def _log_startup(self):
         if self.culling_enabled and self.octree is not None:
@@ -112,6 +156,12 @@ class ViewerRenderer:
             print("[viewer] Profiling       : disabled via --no-profiling "
                   "(toggle live from the sidebar's Status panel)")
 
+    # ── profiling ────────────────────────────────────────────────────────────
+
+    @property
+    def profiling_enabled(self) -> bool:
+        return self.profiler.enabled
+
     def set_profiling_enabled(self, enabled: bool):
         """Runtime toggle (sidebar 'Profiling' checkbox) — cheaper than
         restarting with/without --no-profiling. Resets accumulated stats and
@@ -120,78 +170,40 @@ class ViewerRenderer:
         from before it was disabled."""
         if enabled == self.profiling_enabled:
             return
-        self.profiling_enabled = enabled
         self._prof_frame_count = 0
-        self.profiler.reset()
         if enabled:
-            self.profiler.enable()
+            self._splat_renderer.enable_profiling()
+        else:
+            self._splat_renderer.disable_profiling()
+        self._splat_renderer.reset_profiling()
+        if enabled:
             print(f"[viewer] Profiling       : enabled "
                   f"(warmup {self._prof_warmup} frames, "
                   f"printing every {self._prof_print_every} frames)")
         else:
-            self.profiler.disable()
             print("[viewer] Profiling       : disabled")
 
-    # ── public helpers ────────────────────────────────────────────────────────
-
-    def update_pc_features(self):
-        self.means3D   = self.gaussian_model.get_xyz
-        self.all_ids   = torch.ones(self.means3D.shape[0], dtype=torch.bool,
-                                    device=self.means3D.device)
-        self.means2D   = torch.zeros_like(self.means3D)
-        self.opacity   = self.gaussian_model.get_opacity
-        self.scales    = self.gaussian_model.get_scaling
-        self.rotations = self.gaussian_model.get_rotation
-        self.shs       = self.gaussian_model.get_features
-
-        if self.octree is not None and not self._spatially_ordered:
-            # Reorder all splat tensors to match octree flat_indices leaf order
-            # (GaussianModel.reorder_ — see gsplat2d_rendering/model.py). After
-            # this, leaf j maps to contiguous indices [node_offsets[j], node_offsets[j+1]),
-            # enabling direct slice gather instead of scattered bool-mask gather.
-            perm = torch.from_numpy(
-                self.octree.flat_indices.astype(np.int64)
-            ).to(self.means3D.device)
-            self.gaussian_model.reorder_(perm)
-            del perm
-            self._spatially_ordered = True
-            self.means3D   = self.gaussian_model.get_xyz
-            self.means2D   = torch.zeros_like(self.means3D)
-            self.opacity   = self.gaussian_model.get_opacity
-            self.scales    = self.gaussian_model.get_scaling
-            self.rotations = self.gaussian_model.get_rotation
-            self.shs       = self.gaussian_model.get_features
-            print(f"[viewer] Spatial reorder : {self.means3D.shape[0]:,} splats sorted by octree leaf")
-
-    def disk_kernel(self, opacity):
-        return torch.exp(-0.5 * 100 * torch.clamp(opacity - 0.5, min=0) ** 2)
-
-    def color_map(self, map):
-        if map.min() == map.max():
-            idx = torch.zeros_like(map, device=map.device).round().long().squeeze()
-        else:
-            map = (map - map.min()) / (map.max() - map.min())
-            idx = (map * 255).round().long().squeeze()
-        return self.clm_colors[idx].permute(2, 0, 1)
-
-    # ── frustum culling ───────────────────────────────────────────────────────
-
-    def _apply_frustum_cull(self,
-                             is_in_box: torch.Tensor,
-                             viewpoint_camera):
-        return frustum_cull_mask(
-            self.octree,
-            is_in_box,
-            viewpoint_camera,
-            self._spatially_ordered,
-            self.all_ids,
-            self._node_aabbs_gpu,
-        )
-
-    # ── profiling ─────────────────────────────────────────────────────────────
-
-    # (internal stage key → printed label, display order)
-    _PROF_STAGES = (("sh", "A: SH eval"), ("raster", "B: Rasterize"), ("post", "C: Post-proc"))
+    # Known library stages (in the pipeline order SplatRenderer.render() laps
+    # them), given nicer print labels; anything not listed here (future
+    # library stages, or Kestrel's own "kestrel_post" lap below) falls back
+    # to its raw key with underscores turned to spaces — see
+    # _print_profile_block, which iterates whatever's actually in
+    # Profiler.stats() rather than assuming a fixed stage set.
+    _STAGE_LABELS = {
+        "cull":             "octree cull",
+        "lod_select":       "LOD select",
+        "sparsity":         "sparsity",
+        "narrow_cull":      "narrow cull",
+        "screen_size_cull": "screen-size cull",
+        "bounds_cull":      "crop box",
+        "opacity_cull":     "opacity thresh",
+        "gather":           "gather",
+        "sh_eval":          "SH eval",
+        "render_mode":      "render mode",
+        "rasterize":        "rasterize",
+        "depth_extract":    "depth extract",
+        "kestrel_post":     "Kestrel post-proc",
+    }
 
     def _record_profile(self, n_vis: int):
         """Pulls mean/min/max/count straight from gsplat2d_rendering's own
@@ -217,24 +229,27 @@ class ViewerRenderer:
         self.profiler.reset()
 
     def _print_profile_block(self, n_vis: int, stats: dict):
-        means = {key: stats[key]["mean_ms"] for key, _ in self._PROF_STAGES if key in stats}
-        if not means:
+        if not stats:
             return
+        order      = list(stats.keys())  # Profiler.stats() preserves lap() call order
+        means      = {k: stats[k]["mean_ms"] for k in order}
         total_ms   = sum(means.values())
         fps        = 1000.0 / total_ms if total_ms > 0 else 0.0
-        n_frames   = next(iter(stats.values()))["count"]
+        n_frames   = stats[order[0]]["count"]
         bottleneck = max(means, key=means.get)
+        labels     = {k: self._STAGE_LABELS.get(k, k.replace("_", " ")) for k in order}
+        label_w    = max(max(len(l) for l in labels.values()), len("stage"))
 
         def _stage_row(label: str, mean_ms: float, min_ms: float, max_ms: float,
                        share: float, marker: str) -> str:
             # Marker is a fixed-width field (not appended free-form) so every
             # stage row is exactly as long as the column header, regardless
             # of which stage happens to be the bottleneck this window.
-            return (f" {label:<14}{mean_ms:>7.2f}ms{min_ms:>7.2f}ms"
+            return (f" {label:<{label_w}}  {mean_ms:>7.2f}ms{min_ms:>7.2f}ms"
                     f"{max_ms:>7.2f}ms{share:>7.0f}% {marker:<12}")
 
         header  = f" PROFILE — mean over last {n_frames} frames, {n_vis:,} splats visible "
-        col_row = f" {'stage':<14}{'mean':>9}{'min':>9}{'max':>9}{'share':>8} {'':<12}"
+        col_row = f" {'stage':<{label_w}}  {'mean':>9}{'min':>9}{'max':>9}{'share':>8} {'':<12}"
         W = max(len(header), len(col_row))
 
         def _line(content: str) -> str:
@@ -245,178 +260,58 @@ class ViewerRenderer:
         print(f"[viewer] │{header:^{W}}│")
         print(f"[viewer] ├{rule}┤")
         print(_line(col_row))
-        for key, label in self._PROF_STAGES:
-            if key not in stats:
-                continue
+        for key in order:
             s      = stats[key]
             share  = 100.0 * s["mean_ms"] / total_ms if total_ms > 0 else 0.0
             marker = "◀ bottleneck" if key == bottleneck else ""
-            print(_line(_stage_row(label, s["mean_ms"], s["min_ms"], s["max_ms"], share, marker)))
+            print(_line(_stage_row(labels[key], s["mean_ms"], s["min_ms"], s["max_ms"], share, marker)))
         print(f"[viewer] ├{rule}┤")
         prefix = f" total: {total_ms:.2f}ms"
         suffix = f"{fps:.1f} fps "
         print(_line(prefix + suffix.rjust(W - len(prefix))))
         print(f"[viewer] ╰{rule}╯")
 
+    # ── display helpers ─────────────────────────────────────────────────────
+
+    def color_map(self, map: torch.Tensor) -> torch.Tensor:
+        """Turbo colormap for scalar fields (alpha/depth/distortion) — map
+        is [H, W] (or broadcastable to it), returns [3, H, W]."""
+        if map.min() == map.max():
+            idx = torch.zeros_like(map, device=map.device).round().long().squeeze()
+        else:
+            map = (map - map.min()) / (map.max() - map.min())
+            idx = (map * 255).round().long().squeeze()
+        return self.clm_colors[idx].permute(2, 0, 1)
+
+    def _compute_result(self, rtype: str, output, camera) -> torch.Tensor:
+        if rtype == "render":
+            return output.rgb
+        if rtype == "edge":
+            return self.color_map(gradient_map(output.rgb))
+        if rtype == "rend_alpha":
+            return self.color_map(output.alpha)
+        if rtype == "surf_depth":
+            return self.color_map(output.depth)
+        if rtype == "rend_dist":
+            return self.color_map(output.distortion)
+        if rtype == "rend_normal":
+            # output.normal is raw camera-space kernel output (see
+            # gsplat2d_rendering/render/extras.py) — rotate into world space.
+            world_normal = (output.normal.permute(1, 2, 0)
+                             @ camera.world_view_transform[:3, :3].T).permute(2, 0, 1)
+            return F.normalize(world_normal, dim=0) * 0.5 + 0.5
+        if rtype == "view_normal":
+            return -F.normalize(output.normal, dim=0) * 0.5 + 0.5
+        if rtype in ("surf_normal", "curvature"):
+            surf_normal = gs2d.depth_to_normal(camera, output.depth).permute(2, 0, 1)
+            surf_normal = surf_normal * output.alpha.unsqueeze(0).detach()
+            surf_normal = surf_normal * 0.5 + 0.5
+            if rtype == "curvature":
+                return self.color_map(gradient_map(surf_normal))
+            return surf_normal
+        return output.rgb
+
     # ── main render path ──────────────────────────────────────────────────────
-
-    def render_viewer(self,
-                      viewpoint_camera,
-                      active_sh_degree,
-                      scaling_modifier,
-                      depth_ratio,
-                      bg_color: torch.Tensor,
-                      sparsity: int = 1,
-                      opacity_threshold: float = 0.0,
-                      show_ptc: bool = False,
-                      show_disk: bool = False,
-                      point_size: float = 0.001,
-                      valid_range=None,
-                      compute_post: bool = True):
-        """
-        Render the scene.  bg_color must be on GPU.
-
-        Profiling breakdown (printed when profiling_enabled=True):
-          A:sh     — SH evaluation (pre-computed here for accurate timing)
-          B:raster — CUDA sort + alpha-composite kernel
-          C:post   — normal / depth / distortion maps
-        """
-        tanfovx = math.tan(viewpoint_camera.fov_x * 0.5)
-        tanfovy = math.tan(viewpoint_camera.fov_y * 0.5)
-        raster_settings = GaussianRasterizationSettings(
-            image_height=int(viewpoint_camera.height),
-            image_width=int(viewpoint_camera.width),
-            tanfovx=tanfovx,
-            tanfovy=tanfovy,
-            bg=bg_color,
-            scale_modifier=1.,
-            viewmatrix=viewpoint_camera.world_view_transform,
-            projmatrix=viewpoint_camera.full_proj_transform,
-            sh_degree=active_sh_degree,
-            campos=viewpoint_camera.camera_center,
-            prefiltered=False,
-            debug=False,
-        )
-        rasterizer = GaussianRasterizer(raster_settings=raster_settings)
-
-        # ── spatial crop box ──────────────────────────────────────────────────
-        if valid_range is not None:
-            is_in_box = (
-                (valid_range[0][0] <= self.means3D[:, 0]) & (self.means3D[:, 0] <= valid_range[0][1]) &
-                (valid_range[1][0] <= self.means3D[:, 1]) & (self.means3D[:, 1] <= valid_range[1][1]) &
-                (valid_range[2][0] <= self.means3D[:, 2]) & (self.means3D[:, 2] <= valid_range[2][1])
-            )
-        else:
-            is_in_box = self.all_ids
-
-        # ── frustum culling (CPU octree walk + GPU mask) ──────────────────────
-        vis_ranges = None
-        if self.culling_enabled and self.octree is not None:
-            is_in_box, vis_ranges = self._apply_frustum_cull(is_in_box, viewpoint_camera)
-
-        # ── opacity threshold (GPU, removes near-transparent splats) ──────────
-        if opacity_threshold > 0.0:
-            is_in_box = is_in_box & (self.opacity[:, 0] > opacity_threshold)
-            vis_ranges = None  # ranges no longer safe with per-splat opacity filter
-
-        # ── gather visible splats ─────────────────────────────────────────────
-        # Fast path (spatially ordered, no crop box, no opacity threshold):
-        # contiguous slice-cat per leaf — avoids scattered bool-mask gather.
-        if vis_ranges:
-            _cat = lambda t: torch.cat([t[s:e:sparsity] for s, e in vis_ranges])
-        else:
-            _cat = lambda t: t[is_in_box][::sparsity]
-
-        means3D_f = _cat(self.means3D)
-        means2D_f = _cat(self.means2D)
-        opacity_f = _cat(self.opacity)
-        if show_disk:
-            opacity_f = self.disk_kernel(opacity_f)
-        scales_f = _cat(self.scales)
-        if show_ptc:
-            scales_f = torch.full(scales_f.shape, point_size * 0.1, device=scales_f.device)
-        else:
-            scales_f = scaling_modifier * scales_f
-        rot_f = _cat(self.rotations)
-        shs_f = _cat(self.shs)
-
-        # ── [A] SH evaluation ─────────────────────────────────────────────────
-        # SH is always pre-computed here (not inside the rasterizer) so we can
-        # time it accurately with profiling_enabled=True.
-        self.profiler.start()
-
-        if active_sh_degree > 0:
-            dir_vecs = means3D_f - viewpoint_camera.camera_center
-            dir_vecs = dir_vecs / (dir_vecs.norm(dim=1, keepdim=True) + 1e-8)
-            sh_dim   = (active_sh_degree + 1) ** 2
-            colors   = eval_sh(active_sh_degree,
-                               shs_f.transpose(1, 2)[:, :, :sh_dim],
-                               dir_vecs)
-            colors   = torch.clamp_min(colors + 0.5, 0.0)
-        else:
-            colors = torch.clamp_min(SH_C0 * shs_f[:, 0, :] + 0.5, 0.0)
-
-        self.profiler.lap("sh")
-
-        # ── [B] Rasterizer ────────────────────────────────────────────────────
-        rendered_image, radii, allmap = rasterizer(
-            means3D        = means3D_f,
-            means2D        = means2D_f,
-            shs            = None,
-            colors_precomp = colors,
-            opacities      = opacity_f,
-            scales         = scales_f,
-            rotations      = rot_f,
-            cov3D_precomp  = None,
-        )
-
-        self.profiler.lap("raster")
-
-        # ── [C] Post-processing ───────────────────────────────────────────────
-        if compute_post:
-            render_alpha          = allmap[1:2]
-            render_normal         = allmap[2:5]
-            render_normal         = (
-                render_normal.permute(1, 2, 0) @
-                viewpoint_camera.world_view_transform[:3, :3].T
-            ).permute(2, 0, 1)
-            render_depth_median   = torch.nan_to_num(allmap[5:6], 0, 0)
-            render_depth_expected = torch.nan_to_num(allmap[0:1] / render_alpha, 0, 0)
-            render_dist           = allmap[6:7]
-            surf_depth  = render_depth_expected * (1 - depth_ratio) + depth_ratio * render_depth_median
-            surf_normal = depth_to_normal(viewpoint_camera, surf_depth)
-            surf_normal = surf_normal.permute(2, 0, 1) * render_alpha.detach()
-            render_normal = F.normalize(render_normal, dim=0) * 0.5 + 0.5
-            surf_normal   = surf_normal * 0.5 + 0.5
-            view_normal   = -F.normalize(allmap[2:5], dim=0) * 0.5 + 0.5
-
-        self.profiler.lap("post")
-
-        n_vis = (sum(e - s for s, e in vis_ranges) if vis_ranges
-                 else int(is_in_box.sum())) // sparsity
-        self.last_visible_count = n_vis
-
-        if self.profiling_enabled:
-            self._record_profile(n_vis)
-
-        if not compute_post:
-            return {"render": rendered_image}
-
-        return {
-            "render":          rendered_image,
-            "rend_alpha":      self.color_map(render_alpha.unsqueeze(-1)),
-            "rend_normal":     render_normal,
-            "view_normal":     view_normal,
-            "surf_depth":      self.color_map(surf_depth.unsqueeze(-1)),
-            "surf_depth_raw":  surf_depth.squeeze(0),   # float32 [H, W] in scene units
-            "surf_normal":     surf_normal,
-            "rend_dist":       self.color_map(render_dist.unsqueeze(-1)),
-        }
-
-    # ── output routing ────────────────────────────────────────────────────────
-
-    # Render types that only need the raw rendered image (no allmap post-processing).
-    _POST_FREE = frozenset({"render", "edge"})
 
     def get_outputs(self,
                     camera,
@@ -434,37 +329,45 @@ class ViewerRenderer:
                     render_type: str = "render",
                     render_type1: str = "render",
                     render_type2: str = "render"):
+        # scaling_modifier: currently a no-op — see module docstring.
+        del scaling_modifier
 
-        def get_result(results, rtype):
-            if rtype in results:
-                return results[rtype]
-            if rtype == "curvature":
-                return self.color_map(gradient_map(results["surf_normal"]))
-            if rtype == "edge":
-                return self.color_map(gradient_map(results["render"]))
-            return results["render"]
+        self.gaussian_model.active_sh_degree = min(active_sh_degree, self._max_sh_degree)
+        render_mode = "disk" if (show_ptc and show_disk) else "point" if show_ptc else "gaussian"
+        bounds = tuple(tuple(axis) for axis in valid_range) if valid_range is not None else None
 
-        if split:
-            compute_post = not (render_type1 in self._POST_FREE and render_type2 in self._POST_FREE)
-        else:
-            compute_post = render_type not in self._POST_FREE
-
-        results = self.render_viewer(
-            camera, active_sh_degree, scaling_modifier, depth_ratio,
-            self.background_color,
-            sparsity=sparsity, opacity_threshold=opacity_threshold,
-            valid_range=valid_range,
-            show_ptc=show_ptc, show_disk=show_disk, point_size=point_size,
-            compute_post=compute_post,
+        output = self._splat_renderer.render(
+            camera,
+            render_mode=render_mode, point_size=point_size,
+            sparsity=sparsity, bounds=bounds, min_opacity=opacity_threshold,
+            depth_ratio=depth_ratio,
         )
+        self.last_visible_count = output.num_rendered
+
+        cache: dict[str, torch.Tensor] = {}
+
+        def result(rtype: str) -> torch.Tensor:
+            if rtype not in cache:
+                cache[rtype] = self._compute_result(rtype, output, camera)
+            return cache[rtype]
 
         if not split:
-            return get_result(results, render_type)
+            final = result(render_type)
+        else:
+            final = torch.zeros_like(output.rgb)
+            _, _, H = final.shape
+            sp = int(H * slider)
+            final[:, :, :sp] = result(render_type1)[:, :, :sp]
+            final[:, :, sp:] = result(render_type2)[:, :, sp:]
+            final[:, :, sp]  = torch.ones_like(final[:, :, sp])
 
-        out = torch.zeros_like(results["render"])
-        _, _, H = out.shape
-        sp = int(H * slider)
-        out[:, :, :sp]  = get_result(results, render_type1)[:, :, :sp]
-        out[:, :, sp:]  = get_result(results, render_type2)[:, :, sp:]
-        out[:, :, sp]   = torch.ones_like(out[:, :, sp])
-        return out
+        # Kestrel-side visualization work (color_map/depth_to_normal/
+        # gradient_map above) isn't inside SplatRenderer's own profiler laps —
+        # lap it here, on the same shared Profiler instance, so the printed
+        # breakdown accounts for 100% of frame time, not just the library's
+        # portion of it.
+        self.profiler.lap("kestrel_post")
+        if self.profiling_enabled:
+            self._record_profile(self.last_visible_count)
+
+        return final
