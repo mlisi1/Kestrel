@@ -18,6 +18,8 @@ import sys
 import numpy as np
 from plyfile import PlyData, PlyElement
 
+from gsplat2d_rendering.compression import to_fp16_safe
+
 FP16_MAX = np.float32(65504.0)
 
 
@@ -53,23 +55,11 @@ def _get_sh_degree(el) -> int:
 def _to_f32(arr: np.ndarray) -> np.ndarray:
     return arr.astype(np.float32)
 
-def _to_f16_safe(arr: np.ndarray, label: str = "") -> np.ndarray:
-    """fp16 cast with NaN zeroing and overflow clipping at 99.9th percentile."""
-    arr = arr.astype(np.float32)
-    n_bad = int(np.sum(~np.isfinite(arr)))
-    if n_bad > 0:
-        if label:
-            print(f"  [fp16] {label}: zeroing {n_bad:,} NaN/Inf values")
-        arr = np.where(np.isfinite(arr), arr, 0.0)
-    if np.abs(arr).max() > FP16_MAX:
-        threshold = float(min(np.percentile(np.abs(arr), 99.9), FP16_MAX))
-        n_clip = int(np.sum(np.abs(arr) > threshold))
-        if label:
-            print(f"  [fp16] {label}: clipping {n_clip:,} values to ±{threshold:.1f}")
-        arr = np.clip(arr, -threshold, threshold)
-    return arr.astype(np.float16)
-
-def _to_f16(arr, label=""): return _to_f16_safe(arr, label)
+# fp16 cast with NaN zeroing + 99.9th-percentile overflow clipping —
+# gsplat2d_rendering.compression.to_fp16_safe (same algorithm this file used
+# to duplicate; kept as a local alias since every call site here passes a
+# `label` positionally).
+def _to_f16(arr, label=""): return to_fp16_safe(arr, label)
 
 def _to_i8_norm(arr, lo=-1.0, hi=1.0):
     return np.clip((arr.astype(np.float32) - lo) / (hi - lo) * 254 - 127, -127, 127).astype(np.int8)

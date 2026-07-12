@@ -7,6 +7,8 @@ plyfile
 # Qt viewer
 PyQt5
 
-# CUDA extensions (build from submodule source)
-# pip install -e 2d_gaussian_splatting/submodules/diff-surfel-rasterization
-# pip install -e 2d_gaussian_splatting/submodules/simple-knn
+# Rendering core (model loading, camera, culling/LOD, compression, profiling,
+# SH eval, depth-to-normal) + its vendored CUDA rasterizer — both git
+# submodules of this repo, installed editable:
+# pip install -e gsplat2d-rendering
+# pip install -e gsplat2d-rendering/third_party/diff-surfel-rasterization

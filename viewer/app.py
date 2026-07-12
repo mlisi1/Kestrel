@@ -18,12 +18,10 @@ from PyQt5.QtWidgets import (
 )
 
 _ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-sys.path.insert(0, os.path.join(_ROOT, "2d_gaussian_splatting"))
 
-from cameras.cameras      import Cameras
-from utils.graphics_utils import fov2focal
+import gsplat2d_rendering as gs2d
+
 from renderer             import ViewerRenderer
-from model                import GaussianModelforViewer as GaussianModel
 from viewer.config        import (
     UP_AXIS_VECTORS,
     RENDER_TYPES, RENDER_TYPE_MAP,
@@ -34,8 +32,8 @@ from viewer.widgets       import RenderWidget
 from viewer.sidebar       import Sidebar
 from viewer.dialogs       import HelpMenu
 from viewer.ply_loader    import (
-    _detect_sh_degree, _idx_path, _compressed_ply_path, _load_octree,
-    _load_ply_into_model, _read_ply_numpy, _install_numpy_into_model,
+    _idx_path, _compressed_ply_path, _load_octree,
+    _load_gaussian_model, _model_to_cuda,
     load_model_config, save_model_config,
 )
 
@@ -56,6 +54,17 @@ class LocalViewer(QMainWindow):
         _mcfg = load_model_config(ply_path)
         cfg.update({k: _mcfg[k] for k in _mcfg if k in cfg})
 
+        # gsplat2d_rendering's own log verbosity — set before any library
+        # call so model/octree loading below is covered too. --verbosity
+        # overrides the saved config for this session; omit it (or leave it
+        # at its argparse default of None) to keep using whatever the
+        # sidebar's Verbosity combo was last set to. Not `or`: 0 (SILENT) is
+        # falsy and would otherwise be silently discarded in favor of cfg.
+        _verbosity_arg = getattr(args, 'verbosity', None)
+        if _verbosity_arg is not None:
+            cfg["verbosity"] = _verbosity_arg
+        gs2d.set_verbosity(cfg["verbosity"])
+
         # Determine which PLY to load (restore last-used compression level)
         _start_compression = int(_mcfg.get("compression", 0))
         if _start_compression > 0:
@@ -64,28 +73,22 @@ class LocalViewer(QMainWindow):
         _load_path = (_compressed_ply_path(ply_path, _start_compression)
                       if _start_compression > 0 else ply_path)
 
-        sh = _detect_sh_degree(_load_path) if args.sh_degree < 0 else args.sh_degree
-        self._ply_sh_degree       = sh
         self._current_compression = _start_compression
-        model = GaussianModel(sh_degree=sh)
-        _load_ply_into_model(model, _load_path)
+        model = _load_gaussian_model(_load_path, sh_degree=args.sh_degree, device="cuda")
+        self._ply_sh_degree = model.active_sh_degree
 
         if getattr(args, 'build_index', False):
-            from build_index import build_octree, read_xyz
+            from utils.build_index import read_xyz
             idx_path = _idx_path(ply_path)
             os.makedirs(os.path.dirname(idx_path), exist_ok=True)
-            leaf_max = getattr(args, 'leaf_max', 5000)
-            print(f"[viewer] Building octree index (leaf_max={leaf_max:,}) ...")
-            t0 = time.perf_counter()
             xyz = read_xyz(ply_path)
-            node_aabbs, node_offsets, flat_indices = build_octree(xyz, leaf_max=leaf_max)
-            print(f"[viewer]   Done in {time.perf_counter()-t0:.1f}s — saving to {idx_path}")
+            octree = gs2d.build_octree(xyz, leaf_max=getattr(args, 'leaf_max', 5000))
+            # Not gs2d.save_octree(idx_path, ...): a plain string/Path lets
+            # np.savez_compressed silently append ".npz" to it — writing
+            # through an open handle (save_octree passes file-like objects
+            # through untouched) keeps the literal ".idx" filename.
             with open(idx_path, "wb") as fh:
-                np.savez_compressed(fh, node_aabbs=node_aabbs,
-                                    node_offsets=node_offsets,
-                                    flat_indices=flat_indices)
-            octree = {"node_aabbs": node_aabbs, "node_offsets": node_offsets,
-                      "flat_indices": flat_indices}
+                gs2d.save_octree(fh, octree)
         else:
             octree = _load_octree(ply_path)
 
@@ -97,7 +100,9 @@ class LocalViewer(QMainWindow):
             do_initialize=True,
             octree=octree,
             culling_enabled=not getattr(args, 'no_culling', False),
-            profiling_enabled=not getattr(args, 'no_profiling', False),
+            # --no-profiling always forces it off for the session; otherwise
+            # falls back to the last state of the sidebar's Profiling checkbox.
+            profiling_enabled=cfg["profiling_enabled"] and not getattr(args, 'no_profiling', False),
         )
 
         self.camera = OrbitCamera(world_up=UP_AXIS_VECTORS[cfg["world_up"]].copy())
@@ -229,23 +234,15 @@ class LocalViewer(QMainWindow):
     # ── Index build ────────────────────────────────────────────────────────────
 
     def _build_index_worker(self):
-        from build_index import build_octree, read_xyz
+        from utils.build_index import read_xyz
         try:
             idx_path = _idx_path(self.ply_path)
             os.makedirs(os.path.dirname(idx_path), exist_ok=True)
-            t0 = time.perf_counter()
-            print(f"[viewer] Building octree index (leaf_max={self._leaf_max:,}) ...")
             xyz = read_xyz(self.ply_path)
-            node_aabbs, node_offsets, flat_indices = build_octree(
-                xyz, leaf_max=self._leaf_max)
-            print(f"[viewer]   Done in {time.perf_counter()-t0:.1f}s — saving to {idx_path}")
+            octree = gs2d.build_octree(xyz, leaf_max=self._leaf_max)
             with open(idx_path, "wb") as fh:
-                np.savez_compressed(fh, node_aabbs=node_aabbs,
-                                    node_offsets=node_offsets,
-                                    flat_indices=flat_indices)
-            self._octree_pending = {"node_aabbs":   node_aabbs,
-                                    "node_offsets": node_offsets,
-                                    "flat_indices": flat_indices}
+                gs2d.save_octree(fh, octree)
+            self._octree_pending = octree
             self._render_trig.set()
         except Exception:
             import traceback; traceback.print_exc()
@@ -276,8 +273,10 @@ class LocalViewer(QMainWindow):
                     compressed.write(src_path)
                     print(f"[viewer]   Saved in {time.perf_counter()-t0:.1f}s: {src_path}")
 
-            arrays = _read_ply_numpy(src_path)
-            self._ply_pending = (arrays, level)
+            # Parsed on CPU here (background thread) — moved to CUDA on the
+            # render thread by _render_loop, same split the old code used.
+            model_cpu = _load_gaussian_model(src_path, sh_degree=-1, device="cpu")
+            self._ply_pending = (model_cpu, level)
             self._render_trig.set()
         except Exception:
             import traceback; traceback.print_exc()
@@ -334,22 +333,18 @@ class LocalViewer(QMainWindow):
 
     # ── Camera construction ────────────────────────────────────────────────────
 
-    def _build_camera(self, W: int, H: int) -> "Camera":
+    def _build_camera(self, W: int, H: int) -> gs2d.Camera:
+        # fx=fy (square pixels), fx derived from vertical FOV — matches the
+        # exact convention the old cameras.cameras.Cameras dataclass used.
+        # Not gs2d.Intrinsics.from_fov(): that derives fov_y via a linear
+        # angle scaling (fov_y = fov_x * H/W) rather than the exact
+        # tan()-based relation this fx=fy scheme implies, which would subtly
+        # skew non-square-aspect renders.
         fov_rad = math.radians(self.fov_deg)
-        fx = torch.tensor([fov2focal(fov_rad, H)], dtype=torch.float)
+        fx = H / (2.0 * math.tan(fov_rad * 0.5))
+        intrinsics = gs2d.Intrinsics(width=W, height=H, fx=fx, fy=fx)
         R, T = self.camera.build_RT(self.cam_tf)
-        return Cameras(
-            R=R.unsqueeze(0), T=T.unsqueeze(0), fx=fx, fy=fx,
-            cx=torch.tensor([W // 2], dtype=torch.int),
-            cy=torch.tensor([H // 2], dtype=torch.int),
-            width=torch.tensor([W],   dtype=torch.int),
-            height=torch.tensor([H],  dtype=torch.int),
-            appearance_id=torch.tensor([0], dtype=torch.int),
-            normalized_appearance_id=torch.tensor([0.], dtype=torch.float),
-            time=torch.tensor([0.], dtype=torch.float),
-            distortion_params=None,
-            camera_type=torch.tensor([0], dtype=torch.int),
-        )[0].to_device(self.device)
+        return gs2d.Camera.from_w2c(R.numpy(), T.numpy(), intrinsics, device=str(self.device))
 
     # ── Render thread ──────────────────────────────────────────────────────────
 
@@ -372,14 +367,14 @@ class LocalViewer(QMainWindow):
             ply_pending = self._ply_pending
             if ply_pending is not None:
                 self._ply_pending = None
-                arrays, level = ply_pending
-                _install_numpy_into_model(self.renderer.gaussian_model, arrays)
+                model_cpu, level = ply_pending
+                self.renderer.gaussian_model = _model_to_cuda(model_cpu)
                 self.renderer._spatially_ordered = False
                 self.renderer.culling_enabled = (
                     self.renderer.octree is not None and not self._no_culling_flag
                 )
                 self.renderer.update_pc_features()
-                self._ply_sh_degree    = arrays["active_sh_degree"]
+                self._ply_sh_degree    = self.renderer.gaussian_model.active_sh_degree
                 self._ply_loaded_level = level
 
             W = max(self._render_w, 2)
@@ -429,7 +424,7 @@ class LocalViewer(QMainWindow):
     def _poll_frame(self):
         if self._culling_enabled_flag:
             self._culling_enabled_flag = False
-            self._sidebar.on_culling_ready(len(self.renderer.octree["node_aabbs"]))
+            self._sidebar.on_culling_ready(len(self.renderer.octree.node_aabbs))
             self.render_widget._no_culling_warning = False
             self.render_widget.update()
         if self._build_error_flag:
@@ -486,6 +481,8 @@ class LocalViewer(QMainWindow):
             "render_type":        self.render_type,
             "show_fps_overlay":   ui["show_fps_overlay"],
             "show_splat_overlay": ui["show_splat_overlay"],
+            "profiling_enabled":  self.renderer.profiling_enabled,
+            "verbosity":          gs2d.get_verbosity(),
         })
         save_config(self._cfg)
         save_model_config(self.ply_path, {

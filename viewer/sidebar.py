@@ -12,12 +12,15 @@ from PyQt5.QtWidgets import (
     QSpinBox, QVBoxLayout, QWidget,
 )
 
+import gsplat2d_rendering as gs2d
+
 from viewer.config     import (
     UP_AXIS_OPTIONS,
     AR_RATIO_OPTIONS, AR_RATIO_VALUES,
     RESOLUTION_PRESETS,
     RENDER_TYPES,
     COMPRESSION_LABELS,
+    VERBOSITY_LABELS,
 )
 from viewer.ui_helpers import slider_spin, combo, NoScrollCombo
 from viewer.ply_loader import _compressed_ply_path
@@ -79,7 +82,7 @@ class Sidebar:
             self._culling_status_label.setStyleSheet("color: #888888;")
             f.addRow("Status:", self._culling_status_label)
         elif self.v.renderer.octree is not None:
-            n = len(self.v.renderer.octree["node_aabbs"])
+            n = len(self.v.renderer.octree.node_aabbs)
             self._culling_status_label.setText(f"Active — {n:,} leaves")
             self._culling_status_label.setStyleSheet("color: #66cc66;")
             self._build_idx_btn.setText("Rebuild Index")
@@ -128,6 +131,26 @@ class Sidebar:
         splat_cb.toggled.connect(lambda v: setattr(self.v.render_widget, '_show_splat_overlay', v))
         ol.addWidget(fps_cb); ol.addWidget(splat_cb)
         f.addRow("Overlays:", overlay_row)
+
+        profiling_cb = QCheckBox("print GPU stage breakdown to console")
+        profiling_cb.setChecked(self.v.renderer.profiling_enabled)
+        profiling_cb.setToolTip(
+            "Periodically prints a per-stage (SH eval / rasterize / post-process) "
+            "GPU timing breakdown to the console — see renderer/renderer.py."
+        )
+        profiling_cb.toggled.connect(self.v.renderer.set_profiling_enabled)
+        f.addRow("Profiling:", profiling_cb)
+
+        def _on_verbosity_changed(text: str):
+            gs2d.set_verbosity(int(text.split(" ", 1)[0]))
+
+        verbosity_combo = combo(VERBOSITY_LABELS, VERBOSITY_LABELS[gs2d.get_verbosity()],
+                                _on_verbosity_changed)
+        verbosity_combo.setToolTip(
+            "gsplat2d_rendering console log level — errors always print; "
+            "warnings from Normal up; extra diagnostic detail at Verbose."
+        )
+        f.addRow("Verbosity:", verbosity_combo)
         vbl.addWidget(g)
 
     def _build_camera_group(self, vbl: QVBoxLayout):

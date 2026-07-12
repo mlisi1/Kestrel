@@ -37,11 +37,16 @@ plyfile
 PyQt5
 ```
 
-The 2DGS CUDA rasterizer must be built from the submodule:
+Kestrel's model loading, camera, culling/LOD, compression, profiling, SH evaluation, and
+depth-to-normal all go through
+[`gsplat2d-rendering`](https://github.com/mlisi1/gsplat2d-rendering), a git submodule of
+this repo (`gsplat2d-rendering/`), installed editable alongside its own vendored CUDA
+rasterizer submodule:
 
 ```bash
-pip install -e 2d_gaussian_splatting/submodules/diff-surfel-rasterization
-pip install -e 2d_gaussian_splatting/submodules/simple-knn
+git submodule update --init --recursive
+pip install -e gsplat2d-rendering
+pip install -e gsplat2d-rendering/third_party/diff-surfel-rasterization
 ```
 
 Install Python dependencies:
@@ -110,9 +115,11 @@ configurable in the **Camera** sidebar panel and persisted per model.
 <!-- TODO: insert GIF showing FPS improvement before/after building index -->
 ![Frustum culling demo](res/videos/frustum.gif)
 
-Kestrel builds a CPU-side octree over the splat positions. Before each frame, it
-runs a 5-plane Gribb–Hartmann frustum test over all leaf nodes and uploads a single
-boolean mask to the GPU — skipping geometry that cannot be visible.
+Kestrel builds an octree over the splat positions (via `gsplat2d_rendering.build_octree`).
+Before each frame, a 5-plane Gribb–Hartmann frustum test runs directly on GPU over all
+leaf nodes' bounding boxes (`gsplat2d_rendering.culling.visible_leaf_mask_torch`) and the
+result drives a single boolean mask over the splats — skipping geometry that cannot be
+visible.
 
 On a **~5M-splat** scene, frustum culling reduces the active splat count from
 **~2.2M to ~700K** per frame, bringing rasterization time from **~140ms down to
@@ -273,6 +280,8 @@ options:
   --leaf-max N          Max splats per octree leaf (default: 5000)
   --no-culling          Disable frustum culling even if an index exists
   --no-profiling        Suppress per-frame GPU timing output
+  --verbosity {0,1,2}   gsplat2d_rendering log level: 0=silent, 1=normal, 2=verbose
+                        (also toggleable live from the sidebar's Status panel)
   --fp16-load           Transfer tensors via fp16 during PLY load
 ```
 
