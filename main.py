@@ -19,7 +19,8 @@ def _make_parser() -> argparse.ArgumentParser:
     p.add_argument("--no-culling",   action="store_true", default=False,
                    help="Disable frustum culling even when an octree index exists")
     p.add_argument("--no-profiling", action="store_true", default=False,
-                   help="Disable per-frame GPU timing output")
+                   help="Disable per-frame GPU timing output at startup "
+                        "(also toggleable live from the sidebar's Status panel)")
     p.add_argument("--build-index",  action="store_true", default=False,
                    help="Build (or rebuild) the octree frustum-culling index")
     p.add_argument("--leaf-max",     type=int, default=5000,

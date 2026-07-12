@@ -79,7 +79,7 @@ class Sidebar:
             self._culling_status_label.setStyleSheet("color: #888888;")
             f.addRow("Status:", self._culling_status_label)
         elif self.v.renderer.octree is not None:
-            n = len(self.v.renderer.octree["node_aabbs"])
+            n = len(self.v.renderer.octree.node_aabbs)
             self._culling_status_label.setText(f"Active — {n:,} leaves")
             self._culling_status_label.setStyleSheet("color: #66cc66;")
             self._build_idx_btn.setText("Rebuild Index")
@@ -128,6 +128,15 @@ class Sidebar:
         splat_cb.toggled.connect(lambda v: setattr(self.v.render_widget, '_show_splat_overlay', v))
         ol.addWidget(fps_cb); ol.addWidget(splat_cb)
         f.addRow("Overlays:", overlay_row)
+
+        profiling_cb = QCheckBox("print GPU stage breakdown to console")
+        profiling_cb.setChecked(self.v.renderer.profiling_enabled)
+        profiling_cb.setToolTip(
+            "Periodically prints a per-stage (SH eval / rasterize / post-process) "
+            "GPU timing breakdown to the console — see renderer/renderer.py."
+        )
+        profiling_cb.toggled.connect(self.v.renderer.set_profiling_enabled)
+        f.addRow("Profiling:", profiling_cb)
         vbl.addWidget(g)
 
     def _build_camera_group(self, vbl: QVBoxLayout):

@@ -95,6 +95,7 @@ CONFIG_DEFAULTS: dict = {
     "render_type":        "RGB",
     "show_fps_overlay":   True,
     "show_splat_overlay": True,
+    "profiling_enabled":  True,
 }
 
 

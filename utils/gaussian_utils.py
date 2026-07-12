@@ -168,7 +168,7 @@ class Gaussian:
         dtype_full = [(attribute, 'f4') for attribute in construct_list_of_attributes()]
         attribute_list = [xyz, normals, f_dc, f_rest, opacities, scale, rotation]
         if with_colors is True:
-            from utils.sh_utils import eval_sh
+            from gsplat2d_rendering.sh import eval_sh
             rgbs = np.clip((eval_sh(0, self.features_dc, None) + 0.5), 0., 1.)
             rgbs = (rgbs * 255).astype(np.uint8)
             dtype_full += [('red', 'u1'), ('green', 'u1'), ('blue', 'u1')]

@@ -1,26 +1,31 @@
-"""ViewerRenderer: GPU render pipeline for 2D Gaussian Splatting scenes."""
+"""ViewerRenderer: GPU render pipeline for 2D Gaussian Splatting scenes.
 
-import collections
+Kept as Kestrel's own render path (rather than gsplat2d_rendering's
+SplatRenderer/Renderer facade) because it supports render types and display
+modes the library doesn't expose yet (normal/alpha/distortion maps,
+point-cloud/disk display, crop box, sparsity, a live opacity-threshold
+slider) — see docs/gsplat2d-rendering-gap.md for the plan to fold this back
+into the library. Model loading, camera construction, octree building,
+per-frame profiling, SH evaluation, and depth-to-normal all go through
+gsplat2d_rendering; only the rasterization call itself stays local. Kestrel
+no longer depends on the 2d_gaussian_splatting submodule at all —
+diff_surfel_rasterization resolves via the globally pip-installed package
+built from gsplat2d-rendering's own vendored copy.
+"""
+
 import math
-import os
-import sys
 
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
 import torch.nn.functional as F
-
-_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-_2DGS = os.path.join(_ROOT, "2d_gaussian_splatting")
-
-if _2DGS not in sys.path:
-    sys.path.insert(0, _2DGS)
-
 from diff_surfel_rasterization import GaussianRasterizationSettings, GaussianRasterizer
-from utils.point_utils import depth_to_normal
-from utils.sh_utils import eval_sh
 
-from renderer.helpers import SH_C0, gradient_map, _CudaTimer
+from gsplat2d_rendering.render.profiling import Profiler
+from gsplat2d_rendering.render.depth_normal import depth_to_normal
+from gsplat2d_rendering.sh import C0 as SH_C0, eval_sh
+
+from renderer.helpers import gradient_map
 from renderer.culling import frustum_cull_mask
 
 
@@ -30,7 +35,7 @@ class ViewerRenderer:
                  background_color,
                  do_initialize: bool = True,
                  # Frustum culling
-                 octree: dict | None = None,
+                 octree=None,
                  culling_enabled: bool = True,
                  # Per-frame profiling
                  profiling_enabled: bool = True,
@@ -39,9 +44,10 @@ class ViewerRenderer:
         """
         Parameters
         ----------
+        gaussian_model
+            gsplat2d_rendering.GaussianModel
         octree
-            Dict with keys node_aabbs / node_offsets / flat_indices.
-            None disables frustum culling.
+            gsplat2d_rendering.culling.Octree, or None to disable frustum culling.
         culling_enabled
             Set False to bypass culling even when an octree is present.
         profiling_enabled
@@ -57,13 +63,22 @@ class ViewerRenderer:
         self.octree             = octree
         self.culling_enabled    = culling_enabled
         self._spatially_ordered = False
+        self._node_aabbs_gpu    = None
+        self._update_node_aabbs_gpu()
 
-        # Profiling state
-        self.profiling_enabled     = profiling_enabled
-        self._prof_warmup          = profiling_warmup
-        self._prof_print_every     = profiling_print_every
-        self._prof_frame_count     = 0
-        self._prof_history: dict   = collections.defaultdict(list)
+        # Profiling state — gsplat2d_rendering's own stage-timing collector
+        # (see render/profiling.py). Stats accumulate in the Profiler itself
+        # (mean/min/max/count per stage) rather than a Kestrel-side history
+        # list; _record_profile below prints + resets it every
+        # profiling_print_every frames, so each printed block is a fresh
+        # window rather than an all-time running average.
+        self.profiler               = Profiler(sync_fn=torch.cuda.synchronize)
+        self.profiling_enabled      = profiling_enabled
+        if profiling_enabled:
+            self.profiler.enable()
+        self._prof_warmup           = profiling_warmup
+        self._prof_print_every      = profiling_print_every
+        self._prof_frame_count      = 0
 
         # Exposed after each render_viewer() call
         self.last_visible_count    = 0
@@ -73,9 +88,15 @@ class ViewerRenderer:
 
         self._log_startup()
 
+    def _update_node_aabbs_gpu(self):
+        if self.octree is not None:
+            self._node_aabbs_gpu = torch.from_numpy(self.octree.node_aabbs).cuda()
+        else:
+            self._node_aabbs_gpu = None
+
     def _log_startup(self):
         if self.culling_enabled and self.octree is not None:
-            L = len(self.octree["node_aabbs"])
+            L = len(self.octree.node_aabbs)
             print(f"[viewer] Frustum culling : enabled — {L:,} leaf nodes")
         elif not self.culling_enabled:
             print("[viewer] Frustum culling : disabled via --no-culling")
@@ -85,9 +106,31 @@ class ViewerRenderer:
         if self.profiling_enabled:
             print(f"[viewer] Profiling       : enabled "
                   f"(warmup {self._prof_warmup} frames, "
-                  f"print every {self._prof_print_every} frames)")
+                  f"printing a stage breakdown every {self._prof_print_every} frames — "
+                  f"toggle live from the sidebar's Status panel)")
         else:
-            print("[viewer] Profiling       : disabled via --no-profiling")
+            print("[viewer] Profiling       : disabled via --no-profiling "
+                  "(toggle live from the sidebar's Status panel)")
+
+    def set_profiling_enabled(self, enabled: bool):
+        """Runtime toggle (sidebar 'Profiling' checkbox) — cheaper than
+        restarting with/without --no-profiling. Resets accumulated stats and
+        the warmup counter on every toggle, so turning it back on always
+        starts a clean warmup window rather than mixing in stale timings
+        from before it was disabled."""
+        if enabled == self.profiling_enabled:
+            return
+        self.profiling_enabled = enabled
+        self._prof_frame_count = 0
+        self.profiler.reset()
+        if enabled:
+            self.profiler.enable()
+            print(f"[viewer] Profiling       : enabled "
+                  f"(warmup {self._prof_warmup} frames, "
+                  f"printing every {self._prof_print_every} frames)")
+        else:
+            self.profiler.disable()
+            print("[viewer] Profiling       : disabled")
 
     # ── public helpers ────────────────────────────────────────────────────────
 
@@ -102,18 +145,14 @@ class ViewerRenderer:
         self.shs       = self.gaussian_model.get_features
 
         if self.octree is not None and not self._spatially_ordered:
-            # Reorder all splat tensors to match octree flat_indices leaf order.
-            # After this, leaf j maps to contiguous indices [node_offsets[j], node_offsets[j+1]),
+            # Reorder all splat tensors to match octree flat_indices leaf order
+            # (GaussianModel.reorder_ — see gsplat2d_rendering/model.py). After
+            # this, leaf j maps to contiguous indices [node_offsets[j], node_offsets[j+1]),
             # enabling direct slice gather instead of scattered bool-mask gather.
-            # Done one attribute at a time so peak VRAM stays at 2× per-attribute, not 2× total.
             perm = torch.from_numpy(
-                self.octree["flat_indices"].astype(np.int64)
+                self.octree.flat_indices.astype(np.int64)
             ).to(self.means3D.device)
-            for attr in ('_xyz', '_opacity', '_scaling', '_rotation',
-                         '_features_dc', '_features_rest'):
-                old = getattr(self.gaussian_model, attr)
-                setattr(self.gaussian_model, attr, old[perm].contiguous())
-                del old
+            self.gaussian_model.reorder_(perm)
             del perm
             self._spatially_ordered = True
             self.means3D   = self.gaussian_model.get_xyz
@@ -146,39 +185,78 @@ class ViewerRenderer:
             viewpoint_camera,
             self._spatially_ordered,
             self.all_ids,
+            self._node_aabbs_gpu,
         )
 
     # ── profiling ─────────────────────────────────────────────────────────────
 
-    def _record_profile(self, n_vis: int, sh_ms: float,
-                        raster_ms: float, post_ms: float):
+    # (internal stage key → printed label, display order)
+    _PROF_STAGES = (("sh", "A: SH eval"), ("raster", "B: Rasterize"), ("post", "C: Post-proc"))
+
+    def _record_profile(self, n_vis: int):
+        """Pulls mean/min/max/count straight from gsplat2d_rendering's own
+        Profiler.stats() (accumulated since the last reset) rather than
+        keeping a second, Kestrel-side rolling-window history — reset()
+        every profiling_print_every frames turns that cumulative window into
+        a fresh one each time a block prints, so figures always reflect only
+        the frames since the last printout, not an all-time average."""
         self._prof_frame_count += 1
+
+        if self._prof_frame_count == self._prof_warmup + 1:
+            # Warmup just ended — drop whatever accumulated during it (first
+            # frames after (re)enabling profiling include CUDA/JIT warmup
+            # cost that isn't representative of steady-state performance).
+            self.profiler.reset()
         if self._prof_frame_count <= self._prof_warmup:
             return
-
-        h = self._prof_history
-        h["sh"].append(sh_ms)
-        h["raster"].append(raster_ms)
-        h["post"].append(post_ms)
-        total = sh_ms + raster_ms + post_ms
-        h["total"].append(total)
-
-        if len(h["total"]) % self._prof_print_every != 0:
+        if (self._prof_frame_count - self._prof_warmup) % self._prof_print_every != 0:
             return
 
-        W   = self._prof_print_every
-        avg = lambda k: float(np.mean(h[k][-W:]))
-        sh_a, rast_a, post_a, tot_a = avg("sh"), avg("raster"), avg("post"), avg("total")
-        fps  = 1000.0 / tot_a if tot_a > 0 else 0.0
-        parts = {"A:sh": sh_a, "B:raster": rast_a, "C:post": post_a}
-        bneck = max(parts, key=parts.get)
-        pct   = 100.0 * parts[bneck] / tot_a
-        print(
-            f"[PROFILE] n={n_vis:,}  "
-            f"A:sh={sh_a:.1f}ms  B:raster={rast_a:.1f}ms  C:post={post_a:.1f}ms  "
-            f"total={tot_a:.1f}ms  {fps:.1f}fps  "
-            f"bottleneck→{bneck}({pct:.0f}%)"
-        )
+        stats = self.profiler.stats()
+        self._print_profile_block(n_vis, stats)
+        self.profiler.reset()
+
+    def _print_profile_block(self, n_vis: int, stats: dict):
+        means = {key: stats[key]["mean_ms"] for key, _ in self._PROF_STAGES if key in stats}
+        if not means:
+            return
+        total_ms   = sum(means.values())
+        fps        = 1000.0 / total_ms if total_ms > 0 else 0.0
+        n_frames   = next(iter(stats.values()))["count"]
+        bottleneck = max(means, key=means.get)
+
+        def _stage_row(label: str, mean_ms: float, min_ms: float, max_ms: float,
+                       share: float, marker: str) -> str:
+            # Marker is a fixed-width field (not appended free-form) so every
+            # stage row is exactly as long as the column header, regardless
+            # of which stage happens to be the bottleneck this window.
+            return (f" {label:<14}{mean_ms:>7.2f}ms{min_ms:>7.2f}ms"
+                    f"{max_ms:>7.2f}ms{share:>7.0f}% {marker:<12}")
+
+        header  = f" PROFILE — mean over last {n_frames} frames, {n_vis:,} splats visible "
+        col_row = f" {'stage':<14}{'mean':>9}{'min':>9}{'max':>9}{'share':>8} {'':<12}"
+        W = max(len(header), len(col_row))
+
+        def _line(content: str) -> str:
+            return f"[viewer] │{content:<{W}}│"
+
+        rule = "─" * W
+        print(f"[viewer] ╭{rule}╮")
+        print(f"[viewer] │{header:^{W}}│")
+        print(f"[viewer] ├{rule}┤")
+        print(_line(col_row))
+        for key, label in self._PROF_STAGES:
+            if key not in stats:
+                continue
+            s      = stats[key]
+            share  = 100.0 * s["mean_ms"] / total_ms if total_ms > 0 else 0.0
+            marker = "◀ bottleneck" if key == bottleneck else ""
+            print(_line(_stage_row(label, s["mean_ms"], s["min_ms"], s["max_ms"], share, marker)))
+        print(f"[viewer] ├{rule}┤")
+        prefix = f" total: {total_ms:.2f}ms"
+        suffix = f"{fps:.1f} fps "
+        print(_line(prefix + suffix.rjust(W - len(prefix))))
+        print(f"[viewer] ╰{rule}╯")
 
     # ── main render path ──────────────────────────────────────────────────────
 
@@ -265,9 +343,7 @@ class ViewerRenderer:
         # ── [A] SH evaluation ─────────────────────────────────────────────────
         # SH is always pre-computed here (not inside the rasterizer) so we can
         # time it accurately with profiling_enabled=True.
-        if self.profiling_enabled:
-            timer_sh = _CudaTimer()
-            timer_sh.__enter__()
+        self.profiler.start()
 
         if active_sh_degree > 0:
             dir_vecs = means3D_f - viewpoint_camera.camera_center
@@ -280,14 +356,9 @@ class ViewerRenderer:
         else:
             colors = torch.clamp_min(SH_C0 * shs_f[:, 0, :] + 0.5, 0.0)
 
-        if self.profiling_enabled:
-            timer_sh.__exit__(None, None, None)
+        self.profiler.lap("sh")
 
         # ── [B] Rasterizer ────────────────────────────────────────────────────
-        if self.profiling_enabled:
-            timer_raster = _CudaTimer()
-            timer_raster.__enter__()
-
         rendered_image, radii, allmap = rasterizer(
             means3D        = means3D_f,
             means2D        = means2D_f,
@@ -299,14 +370,9 @@ class ViewerRenderer:
             cov3D_precomp  = None,
         )
 
-        if self.profiling_enabled:
-            timer_raster.__exit__(None, None, None)
+        self.profiler.lap("raster")
 
         # ── [C] Post-processing ───────────────────────────────────────────────
-        if self.profiling_enabled:
-            timer_post = _CudaTimer()
-            timer_post.__enter__()
-
         if compute_post:
             render_alpha          = allmap[1:2]
             render_normal         = allmap[2:5]
@@ -324,15 +390,14 @@ class ViewerRenderer:
             surf_normal   = surf_normal * 0.5 + 0.5
             view_normal   = -F.normalize(allmap[2:5], dim=0) * 0.5 + 0.5
 
-        if self.profiling_enabled:
-            timer_post.__exit__(None, None, None)
+        self.profiler.lap("post")
 
         n_vis = (sum(e - s for s, e in vis_ranges) if vis_ranges
                  else int(is_in_box.sum())) // sparsity
         self.last_visible_count = n_vis
 
         if self.profiling_enabled:
-            self._record_profile(n_vis, timer_sh.ms, timer_raster.ms, timer_post.ms)
+            self._record_profile(n_vis)
 
         if not compute_post:
             return {"render": rendered_image}
