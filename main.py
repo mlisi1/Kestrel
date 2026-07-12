@@ -33,6 +33,10 @@ def _make_parser() -> argparse.ArgumentParser:
                    help="Transfer tensors via fp16 during PLY load")
     p.add_argument("--iterations",   type=int, default=30000,
                    help="Iteration number when resolving model directory path")
+    p.add_argument("--debug-dual-camera", action="store_true", default=False,
+                   help="Debug mode: a second, mouse-orbit-controlled camera "
+                        "you can Tab into, for auditing what the keyboard-"
+                        "controlled render camera's frustum selects")
     return p
 
 

@@ -277,7 +277,11 @@ class ViewerRenderer:
             idx = (map * 255).round().long().squeeze()
         return self.clm_colors[idx].permute(2, 0, 1)
 
-    def _compute_result(self, rtype: str, output, camera) -> torch.Tensor:
+    def _compute_result(self, rtype: str, output, proj_camera) -> torch.Tensor:
+        """proj_camera must be whichever camera actually produced output's
+        pixels (render_camera if one was passed to get_outputs(), else the
+        cull camera) — rend_normal/surf_normal/curvature all reproject
+        relative to it."""
         if rtype == "render":
             return output.rgb
         if rtype == "edge":
@@ -292,12 +296,12 @@ class ViewerRenderer:
             # output.normal is raw camera-space kernel output (see
             # gsplat2d_rendering/render/extras.py) — rotate into world space.
             world_normal = (output.normal.permute(1, 2, 0)
-                             @ camera.world_view_transform[:3, :3].T).permute(2, 0, 1)
+                             @ proj_camera.world_view_transform[:3, :3].T).permute(2, 0, 1)
             return F.normalize(world_normal, dim=0) * 0.5 + 0.5
         if rtype == "view_normal":
             return -F.normalize(output.normal, dim=0) * 0.5 + 0.5
         if rtype in ("surf_normal", "curvature"):
-            surf_normal = gs2d.depth_to_normal(camera, output.depth).permute(2, 0, 1)
+            surf_normal = gs2d.depth_to_normal(proj_camera, output.depth).permute(2, 0, 1)
             surf_normal = surf_normal * output.alpha.unsqueeze(0).detach()
             surf_normal = surf_normal * 0.5 + 0.5
             if rtype == "curvature":
@@ -309,6 +313,7 @@ class ViewerRenderer:
 
     def get_outputs(self,
                     camera,
+                    render_camera=None,
                     valid_range: tuple = None,
                     split: bool = False,
                     slider: float = 0.5,
@@ -331,18 +336,19 @@ class ViewerRenderer:
         bounds = tuple(tuple(axis) for axis in valid_range) if valid_range is not None else None
 
         output = self._splat_renderer.render(
-            camera,
+            camera, render_camera=render_camera,
             render_mode=render_mode, point_size=point_size,
             sparsity=sparsity, bounds=bounds, min_opacity=opacity_threshold,
             depth_ratio=depth_ratio,
         )
         self.last_visible_count = output.num_rendered
+        proj_camera = render_camera if render_camera is not None else camera
 
         cache: dict[str, torch.Tensor] = {}
 
         def result(rtype: str) -> torch.Tensor:
             if rtype not in cache:
-                cache[rtype] = self._compute_result(rtype, output, camera)
+                cache[rtype] = self._compute_result(rtype, output, proj_camera)
             return cache[rtype]
 
         if not split:

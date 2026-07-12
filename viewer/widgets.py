@@ -42,14 +42,33 @@ class RenderWidget(QLabel):
         self._show_fps_overlay   = True
         self._show_splat_overlay = True
         self._no_culling_warning = False
+        self._render_wh          = None   # (W, H) of the last rendered frame
+        self._frustum_corners_px = None   # [8, 2] px, or None -- see set_frustum_overlay
+        self._debug_banner_text  = None   # dual-camera-debug status line, or None
         self.setAlignment(Qt.AlignCenter)
         self.setMinimumSize(640, 360)
         self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         self.setStyleSheet("background: #1a1a1a;")
         self.setFocusPolicy(Qt.StrongFocus)
 
+    def set_camera(self, camera):
+        """Retarget which camera mouse events drive -- used by
+        dual-camera-debug mode's Tab toggle, so mouse orbit always follows
+        whichever camera is currently displayed."""
+        self.cam = camera
+
+    def focusNextPrevChild(self, next: bool) -> bool:
+        # Qt.StrongFocus widgets otherwise consume Tab/Shift+Tab for focus
+        # navigation in event() before keyPressEvent ever runs -- this
+        # widget wants Tab delivered as a normal key (dual-camera-debug's
+        # A/B view toggle), not stolen for focus-cycling. Harmless when that
+        # mode is off: an unhandled Key_Tab just becomes an inert entry in
+        # LocalViewer._keys_held.
+        return False
+
     def set_frame(self, img_np: np.ndarray):
         H, W = img_np.shape[:2]
+        self._render_wh = (W, H)
         qimg = QImage(img_np.tobytes(), W, H, W * 3, QImage.Format_RGB888)
         self.setPixmap(QPixmap.fromImage(qimg).scaled(
             self.size(), Qt.KeepAspectRatio, Qt.FastTransformation))
@@ -106,6 +125,18 @@ class RenderWidget(QLabel):
         self._splat_history.append(n)
         self.update()
 
+    def set_frustum_overlay(self, corners_px: np.ndarray | None):
+        """corners_px: [8, 2] pixel coords (render-resolution space, see
+        viewer.camera.project_world_points), or None to clear."""
+        self._frustum_corners_px = corners_px
+        self.update()
+
+    def set_debug_banner(self, text: str | None):
+        """Dual-camera-debug status line (which camera is displayed), or
+        None to hide -- see LocalViewer._dual_camera_debug."""
+        self._debug_banner_text = text
+        self.update()
+
     # ── paint overlays ─────────────────────────────────────────────────────────
 
     def paintEvent(self, e):
@@ -122,6 +153,14 @@ class RenderWidget(QLabel):
         if self._no_culling_warning:
             p = QPainter(self)
             self._draw_culling_warning(p)
+            p.end()
+        if self._frustum_corners_px is not None:
+            p = QPainter(self)
+            self._draw_frustum_overlay(p)
+            p.end()
+        if self._debug_banner_text:
+            p = QPainter(self)
+            self._draw_debug_banner(p)
             p.end()
 
     def _draw_fps_overlay(self, p: QPainter):
@@ -271,4 +310,56 @@ class RenderWidget(QLabel):
         p.setPen(QColor(255, 255, 255, 230))
         p.drawText(QRectF(float(MARGIN + PAD_X), float(MARGIN),
                           float(tw), float(bh)),
+                   Qt.AlignVCenter, text)
+
+    def _draw_frustum_overlay(self, p: QPainter):
+        pm = self.pixmap()
+        if pm is None or self._render_wh is None or self._render_wh[0] <= 0:
+            return
+        scale = pm.width() / self._render_wh[0]   # uniform: KeepAspectRatio
+        ox = (self.width()  - pm.width())  / 2.0
+        oy = (self.height() - pm.height()) / 2.0
+
+        pts = []
+        for x, y in self._frustum_corners_px:
+            if math.isnan(x) or math.isnan(y):
+                pts.append(None)
+            else:
+                pts.append(QPointF(ox + x * scale, oy + y * scale))
+
+        p.setRenderHint(QPainter.Antialiasing)
+        p.setPen(QPen(QColor(255, 0, 255, 220), 1.5))
+
+        def _edge(i: int, j: int):
+            if pts[i] is not None and pts[j] is not None:
+                p.drawLine(pts[i], pts[j])
+
+        for i in range(4):                       # near rect
+            _edge(i, (i + 1) % 4)
+        for i in range(4):                       # far rect
+            _edge(4 + i, 4 + (i + 1) % 4)
+        for i in range(4):                       # near-far connectors
+            _edge(i, 4 + i)
+
+    def _draw_debug_banner(self, p: QPainter):
+        MARGIN = 8
+        PAD_X, PAD_Y = 8, 4
+        p.setRenderHint(QPainter.Antialiasing)
+        font = QFont()
+        font.setPointSize(8)
+        font.setBold(True)
+        p.setFont(font)
+        text = self._debug_banner_text
+        fm = p.fontMetrics()
+        tw = fm.horizontalAdvance(text)
+        th = fm.height()
+        bw = tw + PAD_X * 2
+        bh = th + PAD_Y * 2
+        bx = MARGIN
+        by = self.height() - MARGIN - bh
+        p.setPen(Qt.NoPen)
+        p.setBrush(QColor(60, 0, 120, 210))
+        p.drawRoundedRect(bx, by, bw, bh, 4, 4)
+        p.setPen(QColor(255, 255, 255, 230))
+        p.drawText(QRectF(float(bx + PAD_X), float(by), float(tw), float(bh)),
                    Qt.AlignVCenter, text)

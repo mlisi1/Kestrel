@@ -19,6 +19,11 @@ from PyQt5.QtWidgets import (
 
 _ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
+# Mirrors gsplat2d_rendering.camera.ZNEAR_DEFAULT (not re-exported from the
+# package). Only used for the dual-camera-debug frustum wireframe's near
+# plane -- see _render_loop for the (scene-scale-relative) far plane.
+_DEBUG_FRUSTUM_ZNEAR = 0.01
+
 import gsplat2d_rendering as gs2d
 
 from renderer             import ViewerRenderer
@@ -27,7 +32,7 @@ from viewer.config        import (
     RENDER_TYPES, RENDER_TYPE_MAP,
     load_config, save_config, fmt_splats,
 )
-from viewer.camera        import OrbitCamera
+from viewer.camera        import OrbitCamera, frustum_corners_world, project_world_points
 from viewer.widgets       import RenderWidget
 from viewer.sidebar       import Sidebar
 from viewer.dialogs       import HelpMenu
@@ -46,6 +51,7 @@ class LocalViewer(QMainWindow):
         self.ply_path         = ply_path
         self._leaf_max        = getattr(args, 'leaf_max', 5000)
         self._no_culling_flag = getattr(args, 'no_culling', False)
+        self._dual_camera_debug = getattr(args, 'debug_dual_camera', False)
         self.cam_tf           = torch.eye(4, dtype=torch.float64)
 
         # Config: global defaults merged with per-model saved state
@@ -111,6 +117,17 @@ class LocalViewer(QMainWindow):
             self.camera.distance = float(_mcfg.get("camera_distance", 5.0))
             self.camera.yaw      = float(_mcfg.get("camera_yaw",     0.0))
             self.camera.pitch    = float(_mcfg.get("camera_pitch",   0.3))
+
+        # Dual-camera debug mode (--debug-dual-camera): camera_b is a
+        # free-fly observer, entirely separate from camera A (the real
+        # render camera, always keyboard-controlled -- see _kb_tick). Mouse
+        # orbit follows whichever of the two is currently displayed (see
+        # the Tab handler in _on_key_down), so it drives camera_b only once
+        # you've toggled the view onto it. Ephemeral by design -- never
+        # read from or written to _cfg/_mcfg, see closeEvent.
+        self.camera_b = (OrbitCamera(world_up=self.camera.world_up.copy())
+                          if self._dual_camera_debug else None)
+        self._viewing_camera_b = False
 
         self._render_w     = cfg["render_w"]
         self._render_h     = cfg["render_h"]
@@ -185,6 +202,10 @@ class LocalViewer(QMainWindow):
         self.setWindowIcon(QIcon(os.path.join(_ROOT, "res", "kestrel_icon.png")))
         HelpMenu(self)
 
+        # Mouse follows whichever camera is currently displayed (camera A
+        # to start, in both normal and dual-camera-debug mode); the Tab
+        # handler in _on_key_down retargets it to camera_b when the view
+        # toggles. Keyboard always drives camera A regardless (_kb_tick).
         self.render_widget = RenderWidget(self.camera)
         self.render_widget.mouse_inv_x         = self._cfg["mouse_inv_x"]
         self.render_widget.mouse_inv_y         = self._cfg["mouse_inv_y"]
@@ -193,6 +214,8 @@ class LocalViewer(QMainWindow):
         self.render_widget.camera_changed.connect(lambda: self._render_trig.set())
         self.render_widget.key_down.connect(self._on_key_down)
         self.render_widget.key_up.connect(self._on_key_up)
+        if self._dual_camera_debug:
+            self._update_debug_banner()
 
         self._sidebar = Sidebar(self)
         scroll = QScrollArea()
@@ -229,7 +252,19 @@ class LocalViewer(QMainWindow):
 
     def _on_world_up_changed(self, text: str):
         self.camera.world_up = UP_AXIS_VECTORS[text].copy()
+        if self._dual_camera_debug:
+            # Keep camera_b's orbit reference axis from going stale relative
+            # to a mid-session world-up change.
+            self.camera_b.world_up = UP_AXIS_VECTORS[text].copy()
         self._render_trig.set()
+
+    def _update_debug_banner(self):
+        if self._viewing_camera_b:
+            text = ("DEBUG dual-camera — viewing camera B (mouse orbit)  |  "
+                     "camera A still moves in background (WASD)  |  Tab → back to A")
+        else:
+            text = "DEBUG dual-camera — viewing camera A (WASD + mouse)  |  Tab → camera B (orbit)"
+        self.render_widget.set_debug_banner(text)
 
     # ── Index build ────────────────────────────────────────────────────────────
 
@@ -289,6 +324,14 @@ class LocalViewer(QMainWindow):
             self._keys_held.clear(); return
         if key == Qt.Key_R:
             self._reset_camera(); return
+        if key == Qt.Key_Tab and self._dual_camera_debug:
+            self._viewing_camera_b = not self._viewing_camera_b
+            # Mouse follows whichever camera is now displayed; keyboard
+            # (_kb_tick) always drives camera A regardless.
+            self.render_widget.set_camera(self.camera_b if self._viewing_camera_b else self.camera)
+            self._update_debug_banner()
+            self._render_trig.set()
+            return
         self._keys_held.add(key)
 
     def _on_key_up(self, key: int):
@@ -333,17 +376,18 @@ class LocalViewer(QMainWindow):
 
     # ── Camera construction ────────────────────────────────────────────────────
 
-    def _build_camera(self, W: int, H: int) -> gs2d.Camera:
+    def _build_camera(self, W: int, H: int, orbit_cam: OrbitCamera | None = None) -> gs2d.Camera:
         # fx=fy (square pixels), fx derived from vertical FOV — matches the
         # exact convention the old cameras.cameras.Cameras dataclass used.
         # Not gs2d.Intrinsics.from_fov(): that derives fov_y via a linear
         # angle scaling (fov_y = fov_x * H/W) rather than the exact
         # tan()-based relation this fx=fy scheme implies, which would subtly
         # skew non-square-aspect renders.
+        orbit_cam = orbit_cam if orbit_cam is not None else self.camera
         fov_rad = math.radians(self.fov_deg)
         fx = H / (2.0 * math.tan(fov_rad * 0.5))
         intrinsics = gs2d.Intrinsics(width=W, height=H, fx=fx, fy=fx)
-        R, T = self.camera.build_RT(self.cam_tf)
+        R, T = orbit_cam.build_RT(self.cam_tf)
         return gs2d.Camera.from_w2c(R.numpy(), T.numpy(), intrinsics, device=str(self.device))
 
     # ── Render thread ──────────────────────────────────────────────────────────
@@ -383,10 +427,29 @@ class LocalViewer(QMainWindow):
 
             t0 = time.perf_counter()
             try:
-                cam = self._build_camera(W, H)
+                cam = self._build_camera(W, H, self.camera)
+                viewing_b = self._dual_camera_debug and self._viewing_camera_b
+                cam_b = self._build_camera(W, H, self.camera_b) if self._dual_camera_debug else None
+                frustum_overlay = None
+                if viewing_b:
+                    # The library's octree cull has no true far-plane clip
+                    # (see CLAUDE.md: "Far plane deliberately omitted"), so
+                    # there's no single "correct" far extent to draw here --
+                    # it's a pure visualization choice. Scale it to camera
+                    # A's current orbit distance (a proxy for the scale of
+                    # whatever's near its look_at point) instead of a fixed
+                    # far-away constant, so the wireframe stays proportionate
+                    # to the scene rather than dwarfing it.
+                    debug_zfar = max(self.camera.distance * 3.0, _DEBUG_FRUSTUM_ZNEAR * 10)
+                    corners_world = frustum_corners_world(
+                        self.camera, self.fov_deg, W / H,
+                        _DEBUG_FRUSTUM_ZNEAR, debug_zfar,
+                    )
+                    frustum_overlay = project_world_points(corners_world, cam_b)
                 with torch.no_grad():
                     image = self.renderer.get_outputs(
                         cam,
+                        render_camera      = cam_b if viewing_b else None,
                         valid_range       = valid_range,
                         split             = self.split_enabled,
                         slider            = self.split_pos,
@@ -417,7 +480,7 @@ class LocalViewer(QMainWindow):
 
             with self._frame_lock:
                 self._frame_slot = (img_np, fps_str, gpu_str, fps_val, n_splats,
-                                    fmt_splats(n_splats))
+                                    fmt_splats(n_splats), frustum_overlay)
 
     # ── Frame polling ──────────────────────────────────────────────────────────
 
@@ -443,8 +506,10 @@ class LocalViewer(QMainWindow):
             slot, self._frame_slot = self._frame_slot, None
         if slot is None:
             return
-        img_np, fps_str, gpu_str, fps_val, n_splats, splat_str = slot
+        img_np, fps_str, gpu_str, fps_val, n_splats, splat_str, frustum_overlay = slot
         self.render_widget.set_frame(img_np)
+        if self._dual_camera_debug:
+            self.render_widget.set_frustum_overlay(frustum_overlay)
         if fps_val > 0:
             self.render_widget.update_fps(fps_val)
         if n_splats > 0:

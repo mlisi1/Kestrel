@@ -99,7 +99,13 @@ class OrbitCamera:
     def zoom(self, delta: float):
         self.distance = max(0.05, self.distance * (1.0 - delta * 0.15))
 
-    def build_RT(self, cam_tf: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    def camera_frame(self) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+        """pos, right, cam_up, fwd -- the actual view-direction basis (not
+        to be confused with _basis()'s spherical-parameterization reference
+        axes). Factored out of build_RT() so anything that needs to match
+        the exact camera this instance renders with -- e.g.
+        frustum_corners_world() -- shares identical basis math rather than
+        risking a second, subtly different derivation."""
         up  = self.world_up / np.linalg.norm(self.world_up)
         pos = self.position
         fwd = self.look_at - pos;  fwd /= np.linalg.norm(fwd)
@@ -109,6 +115,10 @@ class OrbitCamera:
             right = np.cross(fwd, fwd_ref)
         right /= np.linalg.norm(right)
         cam_up = np.cross(right, fwd)
+        return pos, right, cam_up, fwd
+
+    def build_RT(self, cam_tf: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        pos, right, cam_up, fwd = self.camera_frame()
         # c2w in OpenGL convention (Y-up, Z-backward)
         c2w = torch.eye(4, dtype=torch.float64)
         c2w[:3, 0] = torch.tensor(right,  dtype=torch.float64)
@@ -119,3 +129,53 @@ class OrbitCamera:
         c2w[:3, 1:3] *= -1          # flip Y, Z — matches client.py:get_RT
         w2c = torch.linalg.inv(c2w)
         return w2c[:3, :3].float(), w2c[:3, 3].float()
+
+
+def frustum_corners_world(orbit_cam: OrbitCamera, fov_deg: float, aspect: float,
+                           znear: float, zfar: float) -> np.ndarray:
+    """8 world-space frustum corners for orbit_cam's current pose -- 4 at
+    znear then 4 at zfar, each ordered top-left/top-right/bottom-right/
+    bottom-left. Built from camera_frame(), the exact basis build_RT()
+    feeds into Camera.from_w2c, so this always matches what that camera
+    actually renders (the OpenGL-vs-optical-frame Y/Z flip inside
+    build_RT() is purely an axis-labeling convention for talking to
+    Camera.from_w2c -- it doesn't change which world-space region is
+    physically visible, so it plays no part here). `fov_deg` is vertical
+    FOV (matches LocalViewer.fov_deg / _build_camera's fx=fy convention);
+    `aspect` = width / height."""
+    pos, right, cam_up, fwd = orbit_cam.camera_frame()
+    tan_half_y = math.tan(math.radians(fov_deg) * 0.5)
+    tan_half_x = tan_half_y * aspect
+    corners = np.empty((8, 3), dtype=np.float64)
+    for i, depth in enumerate((znear, zfar)):
+        half_w, half_h = depth * tan_half_x, depth * tan_half_y
+        center = pos + fwd * depth
+        corners[4 * i + 0] = center + cam_up * half_h - right * half_w
+        corners[4 * i + 1] = center + cam_up * half_h + right * half_w
+        corners[4 * i + 2] = center - cam_up * half_h + right * half_w
+        corners[4 * i + 3] = center - cam_up * half_h - right * half_w
+    return corners
+
+
+def project_world_points(points_world: np.ndarray, cam) -> np.ndarray:
+    """Projects [N, 3] world points through cam.full_proj_transform to
+    [N, 2] pixel coordinates in cam.width x cam.height space, using the
+    exact row-vector/transposed convention documented in
+    gsplat2d_rendering.camera's module docstring (`clip = [x,y,z,1] @
+    full_proj_transform`). Pixel mapping is (ndc+1)/2*dim on BOTH axes --
+    no Y-flip -- matching gsplat2d_rendering/render/depth_normal.py's own
+    ndc2pix: the optical y-down convention already agrees with raster
+    y-down, unlike the textbook OpenGL NDC->raster formula. Points behind
+    the camera (clip.w too small) come back as NaN so callers can skip
+    frustum edges touching them."""
+    n = points_world.shape[0]
+    homo = np.concatenate([points_world, np.ones((n, 1))], axis=1)
+    proj = cam.full_proj_transform.detach().cpu().numpy().astype(np.float64)
+    clip = homo @ proj
+    w = clip[:, 3]
+    px = np.full((n, 2), np.nan, dtype=np.float64)
+    valid = w > 1e-4
+    ndc = clip[valid, :3] / w[valid, None]
+    px[valid, 0] = (ndc[:, 0] + 1.0) * 0.5 * cam.width
+    px[valid, 1] = (ndc[:, 1] + 1.0) * 0.5 * cam.height
+    return px
