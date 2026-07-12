@@ -54,6 +54,17 @@ class LocalViewer(QMainWindow):
         _mcfg = load_model_config(ply_path)
         cfg.update({k: _mcfg[k] for k in _mcfg if k in cfg})
 
+        # gsplat2d_rendering's own log verbosity — set before any library
+        # call so model/octree loading below is covered too. --verbosity
+        # overrides the saved config for this session; omit it (or leave it
+        # at its argparse default of None) to keep using whatever the
+        # sidebar's Verbosity combo was last set to. Not `or`: 0 (SILENT) is
+        # falsy and would otherwise be silently discarded in favor of cfg.
+        _verbosity_arg = getattr(args, 'verbosity', None)
+        if _verbosity_arg is not None:
+            cfg["verbosity"] = _verbosity_arg
+        gs2d.set_verbosity(cfg["verbosity"])
+
         # Determine which PLY to load (restore last-used compression level)
         _start_compression = int(_mcfg.get("compression", 0))
         if _start_compression > 0:
@@ -67,23 +78,17 @@ class LocalViewer(QMainWindow):
         self._ply_sh_degree = model.active_sh_degree
 
         if getattr(args, 'build_index', False):
-            from build_index import read_xyz
+            from utils.build_index import read_xyz
             idx_path = _idx_path(ply_path)
             os.makedirs(os.path.dirname(idx_path), exist_ok=True)
-            leaf_max = getattr(args, 'leaf_max', 5000)
-            print(f"[viewer] Building octree index (leaf_max={leaf_max:,}) ...")
-            t0 = time.perf_counter()
             xyz = read_xyz(ply_path)
-            octree = gs2d.build_octree(xyz, leaf_max=leaf_max)
-            print(f"[viewer]   Done in {time.perf_counter()-t0:.1f}s — saving to {idx_path}")
-            # Not gs2d.save_octree(): it str()s its path arg, which makes
-            # np.savez_compressed silently append ".npz" — writing through an
-            # open handle keeps the literal ".idx" filename. See
-            # docs/gsplat2d-rendering-gap.md.
+            octree = gs2d.build_octree(xyz, leaf_max=getattr(args, 'leaf_max', 5000))
+            # Not gs2d.save_octree(idx_path, ...): a plain string/Path lets
+            # np.savez_compressed silently append ".npz" to it — writing
+            # through an open handle (save_octree passes file-like objects
+            # through untouched) keeps the literal ".idx" filename.
             with open(idx_path, "wb") as fh:
-                np.savez_compressed(fh, node_aabbs=octree.node_aabbs,
-                                    node_offsets=octree.node_offsets,
-                                    flat_indices=octree.flat_indices)
+                gs2d.save_octree(fh, octree)
         else:
             octree = _load_octree(ply_path)
 
@@ -229,19 +234,14 @@ class LocalViewer(QMainWindow):
     # ── Index build ────────────────────────────────────────────────────────────
 
     def _build_index_worker(self):
-        from build_index import read_xyz
+        from utils.build_index import read_xyz
         try:
             idx_path = _idx_path(self.ply_path)
             os.makedirs(os.path.dirname(idx_path), exist_ok=True)
-            t0 = time.perf_counter()
-            print(f"[viewer] Building octree index (leaf_max={self._leaf_max:,}) ...")
             xyz = read_xyz(self.ply_path)
             octree = gs2d.build_octree(xyz, leaf_max=self._leaf_max)
-            print(f"[viewer]   Done in {time.perf_counter()-t0:.1f}s — saving to {idx_path}")
             with open(idx_path, "wb") as fh:
-                np.savez_compressed(fh, node_aabbs=octree.node_aabbs,
-                                    node_offsets=octree.node_offsets,
-                                    flat_indices=octree.flat_indices)
+                gs2d.save_octree(fh, octree)
             self._octree_pending = octree
             self._render_trig.set()
         except Exception:
@@ -482,6 +482,7 @@ class LocalViewer(QMainWindow):
             "show_fps_overlay":   ui["show_fps_overlay"],
             "show_splat_overlay": ui["show_splat_overlay"],
             "profiling_enabled":  self.renderer.profiling_enabled,
+            "verbosity":          gs2d.get_verbosity(),
         })
         save_config(self._cfg)
         save_model_config(self.ply_path, {

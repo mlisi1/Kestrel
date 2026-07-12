@@ -98,7 +98,8 @@ class ViewerRenderer:
         (SplatRenderer's own precondition — see its class docstring) and
         (re)builds the underlying SplatRenderer. Called whenever the model
         or octree changes (new PLY installed, compression level switched,
-        background index build finished)."""
+        background index build finished). GaussianModel.reorder_ logs the
+        reorder itself (gsplat2d_rendering's own logging)."""
         if self.octree is not None and not self._spatially_ordered:
             perm = torch.from_numpy(
                 self.octree.flat_indices.astype("int64")
@@ -106,8 +107,6 @@ class ViewerRenderer:
             self.gaussian_model.reorder_(perm)
             del perm
             self._spatially_ordered = True
-            print(f"[viewer] Spatial reorder : {self.gaussian_model.num_points:,} "
-                  f"splats sorted by octree leaf")
         self._max_sh_degree = self.gaussian_model.active_sh_degree
         self._rebuild_splat_renderer()
 
@@ -139,14 +138,9 @@ class ViewerRenderer:
             self._splat_renderer.enable_profiling()
 
     def _log_startup(self):
-        if self.culling_enabled and self.octree is not None:
-            L = len(self.octree.node_aabbs)
-            print(f"[viewer] Frustum culling : enabled — {L:,} leaf nodes")
-        elif not self.culling_enabled:
-            print("[viewer] Frustum culling : disabled via --no-culling")
-        else:
-            print("[viewer] Frustum culling : no index found — run with --build-index to enable")
-
+        # Frustum-culling status is logged by SplatRenderer itself on every
+        # (re)build (gsplat2d_rendering's own logging, see _rebuild_splat_renderer
+        # above) — only Kestrel's own profiling-cadence choice is reported here.
         if self.profiling_enabled:
             print(f"[viewer] Profiling       : enabled "
                   f"(warmup {self._prof_warmup} frames, "

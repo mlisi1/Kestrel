@@ -53,6 +53,9 @@ COMPRESSION_LABELS = [
     "L3 — fp16 + int8",
 ]
 
+# gsplat2d_rendering log verbosity — see gsplat2d_rendering.set_verbosity.
+VERBOSITY_LABELS = ["0 — Silent", "1 — Normal", "2 — Verbose"]
+
 RENDER_TYPE_MAP = {
     "RGB":                "render",
     "Edge":               "edge",
@@ -96,6 +99,7 @@ CONFIG_DEFAULTS: dict = {
     "show_fps_overlay":   True,
     "show_splat_overlay": True,
     "profiling_enabled":  True,
+    "verbosity":          1,       # gsplat2d_rendering log level: 0=silent, 1=normal, 2=verbose
 }
 
 

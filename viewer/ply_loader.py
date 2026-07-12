@@ -35,14 +35,14 @@ def _compressed_ply_path(ply_path: str, level: int) -> str:
 # ── Octree index ──────────────────────────────────────────────────────────────
 
 def _load_octree(ply_path: str):
-    """Returns a gsplat2d_rendering.culling.Octree, or None if no cached index."""
+    """Returns a gsplat2d_rendering.culling.Octree, or None if no cached index.
+    load_octree/SplatRenderer report the leaf count and culling status
+    themselves (gsplat2d_rendering's own logging), so this only applies
+    Kestrel's .kestrel/ path convention."""
     idx = _idx_path(ply_path)
     if not os.path.exists(idx):
-        print(f"[viewer] No octree index found at {idx} — frustum culling disabled")
         return None
-    octree = gs2d.load_octree(idx)
-    print(f"[viewer] Loaded octree index: {len(octree.node_aabbs):,} leaf nodes from {idx}")
-    return octree
+    return gs2d.load_octree(idx)
 
 
 # ── PLY / GaussianModel loading ────────────────────────────────────────────────

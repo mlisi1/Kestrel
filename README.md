@@ -280,6 +280,8 @@ options:
   --leaf-max N          Max splats per octree leaf (default: 5000)
   --no-culling          Disable frustum culling even if an index exists
   --no-profiling        Suppress per-frame GPU timing output
+  --verbosity {0,1,2}   gsplat2d_rendering log level: 0=silent, 1=normal, 2=verbose
+                        (also toggleable live from the sidebar's Status panel)
   --fp16-load           Transfer tensors via fp16 during PLY load
 ```
 
