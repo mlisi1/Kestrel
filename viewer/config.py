@@ -91,7 +91,6 @@ CONFIG_DEFAULTS: dict = {
     "lock_ar":            True,
     "depth_ratio":        0.0,
     "active_sh_degree":   -1,      # -1 = use PLY file's max
-    "opacity_thresh":     0.05,
     "sparsity":           1,
     "scaling_mod":        1.0,
     "point_size":         0.01,
@@ -116,11 +115,13 @@ CONFIG_DEFAULTS: dict = {
                                  # is ever considered, regardless of the frustum test result
                                  # (was "chunk_max_load_distance_mult", a camera.distance
                                  # multiplier) -- sidebar-tunable (Chunk Streaming panel)
-    "chunk_prune_opacity_threshold": 0.0, # permanently drops splats at/under this opacity at the
-                                          # *next* chunk manifest rebuild (utils/build_chunks.py's
-                                          # opacity_threshold) -- separate from the live, per-frame
-                                          # "Opacity threshold" render slider (opacity_thresh)
-                                          # above, which never touches the chunk manifest at all
+    "chunk_prune_opacity_threshold": 0.0, # the one opacity threshold in Kestrel (sidebar's Chunk
+                                          # Streaming panel) -- applied live as the per-frame
+                                          # candidate-filter cutoff (renderer/renderer.py's
+                                          # opacity_threshold param) for an immediate preview, AND
+                                          # passed to utils/build_chunks.py's opacity_threshold to
+                                          # permanently drop splats at/under it the *next* time the
+                                          # chunk manifest is rebuilt. 0.0 = off.
 }
 
 

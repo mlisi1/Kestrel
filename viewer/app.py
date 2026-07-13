@@ -187,7 +187,6 @@ class LocalViewer(QMainWindow):
         self.split_pos      = _mcfg.get("split_pos",     0.5)
         self.depth_ratio    = cfg["depth_ratio"]
         self.sh_degree      = self._ply_sh_degree
-        self.opacity_thresh = cfg["opacity_thresh"]
         self.sparsity       = cfg["sparsity"]
         self.scaling_mod    = cfg["scaling_mod"]
         self.point_size     = cfg["point_size"]
@@ -760,7 +759,7 @@ class LocalViewer(QMainWindow):
                         active_sh_degree  = min(self.sh_degree, self._ply_sh_degree),
                         scaling_modifier  = self.scaling_mod,
                         sparsity          = self.sparsity,
-                        opacity_threshold = self.opacity_thresh,
+                        opacity_threshold = self._chunk_prune_opacity_threshold,
                         depth_ratio       = self.depth_ratio,
                         render_type       = RENDER_TYPE_MAP[self.render_type],
                         render_type1      = RENDER_TYPE_MAP[self.render_type1],
@@ -859,7 +858,6 @@ class LocalViewer(QMainWindow):
             "lock_ar":            self._lock_ar,
             "depth_ratio":        self.depth_ratio,
             "active_sh_degree":   self.sh_degree,
-            "opacity_thresh":     self.opacity_thresh,
             "sparsity":           self.sparsity,
             "scaling_mod":        self.scaling_mod,
             "point_size":         self.point_size,

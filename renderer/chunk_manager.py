@@ -82,9 +82,11 @@ def _move_model(model: GaussianModel, device: str) -> GaussianModel:
     )
 
 
-_ADJACENCY_K = 6  # neighbors per chunk in the K-NN adjacency graph -- see
-                  # _build_adjacency's own docstring for why this, not a
-                  # true "shares a boundary" adjacency, is what's used
+_ADJACENCY_PAD_FRACTION = 0.3  # each chunk AABB is grown by this fraction of its
+                               # own extent (per axis) before the pairwise overlap
+                               # test that defines adjacency -- see _build_adjacency
+_ADJACENCY_FALLBACK_K = 3  # nearest-centroid fallback for a chunk the padded-overlap
+                           # test still leaves with zero neighbors -- see _build_adjacency
 
 
 class ChunkManager:
@@ -106,21 +108,20 @@ class ChunkManager:
         self.fine_leaf_max     = fine_leaf_max
         self.rebuild_throttle_s = rebuild_throttle_s
 
-        # K-nearest-neighbor adjacency graph over chunk centroids, built
-        # once (depends only on the coarse manifest, fixed for the
-        # session). NOT true "shares a boundary" adjacency: build_octree's
-        # leaves are *tight* AABBs around each chunk's actual points, not
-        # padded to the octant they were split from, so there are real gaps
-        # between neighboring chunks (measured directly: a naive "AABBs
-        # touch within an epsilon" test left 35% of chunks with zero
-        # neighbors on a real scene). Fixed-K-nearest-by-centroid instead
-        # guarantees every chunk has exactly K neighbors regardless of its
-        # own size or local density -- not "true" adjacency (a chunk's
-        # K-nearest aren't necessarily chunks that actually border it), but
-        # avoids both the orphan problem above and the opposite failure
-        # mode (a size-relative distance threshold let a single large
-        # sparse chunk become "adjacent" to dozens of others).
-        self._adjacency = self._build_adjacency(manifest.node_aabbs, _ADJACENCY_K)
+        # Spatial adjacency graph over chunk AABBs, built once (depends only
+        # on the coarse manifest, fixed for the session) -- see
+        # _build_adjacency's own docstring for why this is a per-chunk-
+        # relative padded-AABB-overlap test (with a nearest-centroid
+        # fallback for any chunk it still leaves isolated), not a fixed-K-
+        # nearest-centroid graph: a fixed K silently drops genuine neighbors
+        # whenever a chunk has more than K real neighbors, or whenever
+        # neither side of a genuine neighbor pair ranks the other in its own
+        # top-K -- both routinely true on real scenes with irregular,
+        # splat-count-balanced chunk sizes, and both silently broke the
+        # tier-adjacency invariant residency depends on (see update()'s own
+        # docstring and this module's docstring in CLAUDE.md).
+        self._adjacency = self._build_adjacency(
+            manifest.node_aabbs, _ADJACENCY_PAD_FRACTION, _ADJACENCY_FALLBACK_K)
 
         # Populated by update()/initial_sync_load() each time they run --
         # chunk_states() reads these instead of recomputing frustum+BFS
@@ -190,23 +191,84 @@ class ChunkManager:
         self._chunk_reorder_perm: dict[int, torch.Tensor] = {}
 
     @staticmethod
-    def _build_adjacency(aabbs: np.ndarray, k: int) -> dict[int, list[int]]:
-        """K-nearest-neighbor graph over chunk AABB centroids -- see class
-        docstring/__init__ for why this, not a "shares a boundary" test, is
-        used. O(N^2) pairwise distances: fine for the tens-to-low-hundreds
-        of chunks a sane chunk_size produces, not meant to scale to the
+    def _build_adjacency(aabbs: np.ndarray, pad_fraction: float,
+                         fallback_k: int) -> dict[int, list[int]]:
+        """Per-chunk-relative padded-AABB overlap graph -- replaces an
+        earlier fixed-K-nearest-centroid design that turned out to silently
+        drop genuine neighbors two different ways, both reproduced against
+        real scenes as a strict-VRAM chunk bordering a RAM or fully-
+        unloaded chunk with no margin chunk bridging them (violating the
+        tier-adjacency invariant residency depends on -- see update()'s own
+        docstring): (1) a fixed K undercounts whenever a chunk genuinely has
+        more than K real neighbors (common once chunk sizes/densities vary
+        across an adaptive, splat-count-balanced partition -- a small chunk
+        surrounded by several similarly-small neighbors easily exceeds
+        K=6); (2) even after symmetrizing that graph (adding the reverse
+        edge whenever only one side's own top-K ranked the other), a
+        genuine neighbor pair where *neither* side ranked the other in its
+        own top-K -- both had enough *other*, closer centroids to fill their
+        list -- was still missed entirely, since there was no edge in
+        either direction to symmetrize.
+
+        This test instead grows each chunk's own AABB by `pad_fraction` of
+        its own extent (per axis) and checks pairwise overlap of the padded
+        boxes -- symmetric by construction (interval overlap doesn't depend
+        on evaluation order, so no separate symmetrization pass is needed),
+        and scales with each chunk's own size rather than a fixed distance
+        or a fixed neighbor count: build_octree's leaves are *tight* AABBs
+        around each chunk's actual points, not padded to the octant they
+        were split from, so there are real gaps between genuinely
+        neighboring chunks (measured directly: a naive "AABBs touch within
+        an absolute epsilon" test left 35% of chunks with zero neighbors on
+        a real scene, because that epsilon was too small relative to
+        larger/sparser chunks' own gaps). Padding by a fraction of each
+        chunk's *own* extent instead means a large, sparse chunk gets a
+        proportionally large pad and a small, dense chunk gets a small one,
+        closing genuine gaps at both scales at once.
+
+        `fallback_k` nearest-centroid edges are added only for a chunk the
+        overlap test still leaves completely isolated (a genuine spatial
+        outlier, e.g. a single-digit-point chunk isolated from all denser
+        geometry -- see CLAUDE.md's "Chunks can be near-empty by design")
+        -- a safety net so BFS expansion always has *something* to reach
+        from every chunk, not the primary adjacency source.
+
+        O(N^2) pairwise overlap test: fine for the tens-to-low-hundreds of
+        chunks a sane chunk_size produces, not meant to scale to the
         thousands of chunks an extremely fine chunk_size produces (already
         documented elsewhere as outside this feature's intended operating
         range)."""
-        centers = 0.5 * (aabbs[:, :3] + aabbs[:, 3:])
-        n = len(centers)
-        k = min(k, n - 1)
-        if k <= 0:
-            return {i: [] for i in range(n)}
-        dists = np.linalg.norm(centers[:, None, :] - centers[None, :, :], axis=-1)
-        np.fill_diagonal(dists, np.inf)
-        nearest = np.argpartition(dists, k - 1, axis=1)[:, :k]
-        return {i: nearest[i].tolist() for i in range(n)}
+        n = len(aabbs)
+        mins, maxs = aabbs[:, :3], aabbs[:, 3:]
+        extents = np.maximum(maxs - mins, 1e-9)
+        pad = extents * pad_fraction
+        pmins, pmaxs = mins - pad, maxs + pad
+
+        overlap = np.ones((n, n), dtype=bool)
+        for ax in range(3):
+            overlap &= (pmins[:, None, ax] <= pmaxs[None, :, ax])
+            overlap &= (pmaxs[:, None, ax] >= pmins[None, :, ax])
+        np.fill_diagonal(overlap, False)
+
+        adjacency: dict[int, set[int]] = {
+            i: set(np.nonzero(overlap[i])[0].tolist()) for i in range(n)
+        }
+
+        isolated = [i for i in range(n) if not adjacency[i]]
+        if isolated:
+            centers = 0.5 * (mins + maxs)
+            k = min(fallback_k, n - 1)
+            for i in isolated:
+                if k <= 0:
+                    continue
+                dists = np.linalg.norm(centers - centers[i], axis=1)
+                dists[i] = np.inf
+                nearest = np.argpartition(dists, k - 1)[:k]
+                for j in nearest:
+                    adjacency[i].add(int(j))
+                    adjacency[int(j)].add(i)
+
+        return {i: sorted(neighbors) for i, neighbors in adjacency.items()}
 
     def _bfs_expand(self, seed: set[int], hops: int) -> set[int]:
         """All chunk ids reachable from any chunk in `seed` within `hops`

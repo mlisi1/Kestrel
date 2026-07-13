@@ -177,18 +177,22 @@ class Sidebar:
         self._chunk_prune_opacity_spin.setSingleStep(0.005)
         self._chunk_prune_opacity_spin.setValue(self.v._chunk_prune_opacity_threshold)
         self._chunk_prune_opacity_spin.setToolTip(
-            "Permanently drops splats at/under this activated opacity the *next* "
-            "time you click Build/Rebuild Chunk Manifest below -- this is NOT the "
-            "same as the live 'Opacity threshold' render slider in Status/Render "
-            "above, which never touches the chunk manifest and needs no rebuild. "
-            "Eliminates near-invisible floater artifacts that the adaptive split "
-            "would otherwise isolate into their own chunk (nonempty by point "
-            "count, empty-looking on screen). 0 = off. Real scenes can have far "
-            "more near-zero-opacity points than visible ones -- even a small "
-            "value can prune the majority of splats; there's no universal default."
+            "The one opacity threshold in Kestrel -- applies immediately as the "
+            "live per-frame candidate-filter cutoff (same effect as the old "
+            "Gaussian Model 'Opacity Thr' slider, just a preview of what a "
+            "rebuild would prune -- with chunk streaming active, filtering "
+            "post-load like this is redundant with pruning at the source, so "
+            "this preview is the only opacity cull that still does anything), "
+            "AND is what actually gets permanently dropped from disk the *next* "
+            "time you click Build/Rebuild Chunk Manifest below. Eliminates "
+            "near-invisible floater artifacts that the adaptive split would "
+            "otherwise isolate into their own chunk (nonempty by point count, "
+            "empty-looking on screen). 0 = off. Real scenes can have far more "
+            "near-zero-opacity points than visible ones -- even a small value "
+            "can prune the majority of splats; there's no universal default."
         )
         self._chunk_prune_opacity_spin.valueChanged.connect(
-            lambda v: setattr(self.v, '_chunk_prune_opacity_threshold', v))
+            lambda v: self.v._set('_chunk_prune_opacity_threshold', v))
 
         self._chunk_build_btn = QPushButton("Build/Rebuild Chunk Manifest")
         self._chunk_build_btn.clicked.connect(self._on_chunk_build_clicked)
@@ -198,7 +202,7 @@ class Sidebar:
         f.addRow("VRAM margin (hops):", self._chunk_vram_margin_spin)
         f.addRow("RAM margin (hops):", self._chunk_ram_margin_spin)
         f.addRow("Max load hops:", self._chunk_max_load_hops_spin)
-        f.addRow("Prune opacity ≤:", self._chunk_prune_opacity_spin)
+        f.addRow("Opacity ≤:", self._chunk_prune_opacity_spin)
         f.addRow("Status:", self._chunk_status_label)
         f.addRow("Resident:", self._chunk_stats_label)
         f.addRow(self._chunk_build_btn)
@@ -387,10 +391,6 @@ class Sidebar:
         self._sh_spin.setValue(self.v.sh_degree)
         self._sh_spin.valueChanged.connect(lambda v: self.v._set("sh_degree", v))
         f.addRow("SH Degree:", self._sh_spin)
-        f.addRow("Opacity Thr:",
-            slider_spin(0.0, 0.5, self.v.opacity_thresh,
-                        lambda v: self.v._set("opacity_thresh", v),
-                        is_float=True, decimals=3, step=0.005))
         f.addRow("Sparsity:",
             slider_spin(1, 10, self.v.sparsity,
                         lambda v: self.v._set("sparsity", int(v))))

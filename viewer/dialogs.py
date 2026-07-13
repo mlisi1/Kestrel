@@ -128,6 +128,16 @@ frame time significantly on large scenes. Click <b>Build Index</b> once; the ind
 is saved to <code>.kestrel/</code> and reloaded automatically on subsequent runs.
 </p>
 
+<h3>Chunk Streaming</h3>
+<p>
+Streams only the splats near the camera into VRAM/RAM instead of loading the whole
+model up front — see the <i>Chunk Streaming</i> sidebar panel for the margin/hop
+controls. Its <b>Opacity ≤</b> slider is the only opacity threshold in Kestrel: it
+takes effect immediately as a live preview (culling splats at/under that opacity
+from the current render), and is also what actually gets permanently dropped from
+disk the next time you click <b>Build/Rebuild Chunk Manifest</b>.
+</p>
+
 <h3>Compression</h3>
 <p>
 Four levels trade file size against quality:<br>
@@ -153,10 +163,10 @@ the <i>Split Pos</i> slider moves the divider.
 <h3>Gaussian Model Parameters</h3>
 <p>
 <b>SH Degree</b> — reduce for a speed boost (higher spherical-harmonic bands skipped).<br>
-<b>Opacity Threshold</b> — cull splats below this opacity value.<br>
 <b>Sparsity</b> — render every Nth splat; 1 = all splats, 2 = half, etc.<br>
 <b>Scale</b> — global splat size multiplier.<br>
-<b>Pointcloud / disk mode</b> — render splat centres as points or oriented disks.
+<b>Pointcloud / disk mode</b> — render splat centres as points or oriented disks.<br>
+(Opacity threshold now lives in the <i>Chunk Streaming</i> panel — see below.)
 </p>
 
 <h3>Crop Box</h3>
