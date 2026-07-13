@@ -19,6 +19,7 @@ Kestrel addresses this with a set of optimization and compression techniques tha
 ## Features
 
 + **[Frustum culling](#frustum-culling)** — only the splats visible in the current view are passed to the rasterizer, cutting render time proportionally to the fraction of the scene culled.
++ **[Chunk streaming](#chunk-streaming)** — for scenes too large to load whole: only the splats near the camera are kept resident in RAM/VRAM, the rest stays on disk.
 + **[Model compression](#compression)** — three levels of offline compression reduce memory footprint with minimal visual impact.
 + **[Real-time rendering](#render-types)** — RGB, depth, normals, curvature and more at interactive frame rates.
 + **[Split-view](#split-view)** — compare any two render types side by side with a draggable divider.
@@ -37,8 +38,8 @@ plyfile
 PyQt5
 ```
 
-Kestrel's model loading, camera, culling/LOD, compression, profiling, SH evaluation, and
-depth-to-normal all go through
+Kestrel's model loading, camera, culling/LOD, chunk streaming, compression, profiling,
+SH evaluation, and depth-to-normal all go through
 [`gsplat2d-rendering`](https://github.com/mlisi1/gsplat2d-rendering), a git submodule of
 this repo (`gsplat2d-rendering/`), installed editable alongside its own vendored CUDA
 rasterizer submodule:
@@ -136,6 +137,44 @@ Click **Build Index** in the *Frustum Culling* panel once; the index is saved to
 
 ---
 
+## Chunk Streaming
+
+Frustum culling above still requires the *whole* model to be parsed into host RAM and
+uploaded to VRAM before a single splat is skipped — for a scene too large to fit in
+memory at all, that's not enough. Chunk streaming partitions the model into disk chunks
+once, offline, and then keeps only the chunks near the current camera resident in
+RAM/VRAM at all, streaming the rest in and out as the camera moves. Frustum culling
+keeps working unmodified on top of whatever's currently resident.
+
+The mechanism itself (`ChunkManager`) lives in
+[`gsplat2d-rendering`](https://github.com/mlisi1/gsplat2d-rendering), the same rendering
+library everything else above goes through — see that project's own README for how it
+works internally. Kestrel owns the sidebar controls, the `.kestrel/` file convention,
+and the out-of-memory recovery flow around it.
+
+Enable it from the **Chunk Streaming** panel, or force it on for a session with
+`--chunk-streaming`. If a whole-file load runs out of VRAM, Kestrel offers to enable
+chunk streaming and relaunch automatically instead of just crashing.
+
+| Control | Effect |
+|---------|--------|
+| **Enable** | Turn chunk streaming on/off for this model |
+| **Chunk size** | Target splats per disk chunk |
+| **VRAM margin (hops)** | Adjacency-graph hops beyond the camera's view that stay GPU-resident (zero-latency camera rotation across this margin) |
+| **RAM margin (hops)** | Further hops prefetched to CPU only, not yet composited |
+| **Max load hops** | Overall residency reach bound, since the frustum test has no far-plane clip (see Frustum Culling above) |
+| **Opacity ≤** | The one opacity threshold in Kestrel — live preview immediately, permanently pruned the next time the manifest is rebuilt |
+| **Build/Rebuild Chunk Manifest** | (Re)builds the chunk manifest + chunk-reordered PLY, offline, under `.kestrel/` |
+
+Build the manifest ahead of time from the command line instead of waiting for the first
+load:
+
+```bash
+python utils/build_chunks.py path/to/scene.ply --chunk-size 500000
+```
+
+---
+
 ## Compression
 
 <table>
@@ -214,12 +253,15 @@ The **Gaussian Model** panel exposes per-frame render parameters:
 | Control | Effect |
 |---------|--------|
 | **SH Degree** | Active spherical-harmonic bands (0 = diffuse only) |
-| **Opacity Threshold** | Cull splats below this opacity — removes near-transparent debris |
 | **Sparsity** | Render every Nth splat; useful for a quick preview on large models |
 | **Scale** | Global splat size multiplier |
 | **Pointcloud** | Render splat centres as points instead of Gaussians |
 | **Disk mode** | Render oriented disk outlines (requires Pointcloud enabled) |
 | **Point Size** | Radius of pointcloud markers |
+
+> The opacity threshold control lives in the **Chunk Streaming** panel now, not here —
+> see [Chunk Streaming](#chunk-streaming). It's the one opacity threshold in Kestrel,
+> whether or not chunk streaming is actually enabled.
 
 
 
@@ -261,6 +303,8 @@ All viewer artifacts for a given model are stored alongside the PLY file:
 | `<stem>_L1.ply` | fp16-compressed PLY cache |
 | `<stem>_L2.ply` | fp16 + SH-degree-1 PLY cache |
 | `<stem>_L3.ply` | fp16 + int8-quantised PLY cache |
+| `<stem>_chunks.idx` | Chunk-streaming manifest (coarse octree, AABB + row range per chunk) |
+| `<stem>_chunked.ply` | Whole model, physically reordered into chunk-contiguous order |
 | `<stem>_view.json` | Per-model persistent state |
 
 
@@ -274,15 +318,25 @@ positional:
   ply_path              Path to .ply file or model directory
 
 options:
-  --iterations N        Checkpoint iteration when resolving model dir (default: 30000)
-  --sh_degree N         SH degree override (-1 = auto-detect from PLY header)
-  --build-index         Build / rebuild octree index at startup
-  --leaf-max N          Max splats per octree leaf (default: 5000)
-  --no-culling          Disable frustum culling even if an index exists
-  --no-profiling        Suppress per-frame GPU timing output
-  --verbosity {0,1,2}   gsplat2d_rendering log level: 0=silent, 1=normal, 2=verbose
-                        (also toggleable live from the sidebar's Status panel)
-  --fp16-load           Transfer tensors via fp16 during PLY load
+  --iterations N               Checkpoint iteration when resolving model dir (default: 30000)
+  --sh_degree N                SH degree override (-1 = auto-detect from PLY header)
+  --build-index                Build / rebuild octree index at startup
+  --leaf-max N                 Max splats per octree leaf (default: 5000)
+  --no-culling                 Disable frustum culling even if an index exists
+  --no-profiling                Suppress per-frame GPU timing output
+  --verbosity {0,1,2}          gsplat2d_rendering log level: 0=silent, 1=normal, 2=verbose
+                                (also toggleable live from the sidebar's Status panel)
+  --fp16-load                  Transfer tensors via fp16 during PLY load
+  --debug-dual-camera          Debug mode: a second camera to audit frustum culling from
+                                outside the render camera's own view
+  --chunk-streaming             Force-enable chunk streaming for this session (omit to
+                                 use the saved default; also toggleable live from the sidebar)
+  --chunk-size N                Target splats per disk chunk (default: 500,000)
+  --chunk-vram-margin-hops N     Adjacency hops beyond the strict frustum also kept
+                                 VRAM-resident (0 disables this margin)
+  --chunk-ram-margin-hops N      Adjacency hops beyond the VRAM tier prefetched to
+                                 CPU only (0 disables the RAM tier)
+  --build-chunks                Build / rebuild the chunk manifest at startup
 ```
 
 

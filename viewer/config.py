@@ -99,10 +99,10 @@ CONFIG_DEFAULTS: dict = {
     "show_splat_overlay": True,
     "profiling_enabled":  True,
     "verbosity":          1,       # gsplat2d_rendering log level: 0=silent, 1=normal, 2=verbose
-    "chunk_streaming_enabled": False,   # off by default -- see renderer/chunk_manager.py
+    "chunk_streaming_enabled": False,   # off by default -- see gsplat2d_rendering.streaming.ChunkManager
     "chunk_target_size":       500_000, # target splats/chunk, same UX as octree "Leaf size"
-    # Adjacency-hop-count residency (renderer/chunk_manager.py's K-NN chunk
-    # graph + BFS), replacing an earlier world-space-distance design. All
+    # Adjacency-hop-count residency (gsplat2d_rendering.streaming's chunk
+    # adjacency graph + BFS), replacing an earlier world-space-distance design. All
     # three are integers; 0 means "off" for either margin, no separate
     # enable/disable flag needed (same idiom as chunk_size=0 elsewhere).
     "chunk_vram_margin_hops": 0, # adjacency hops beyond the strict frustum that are ALSO

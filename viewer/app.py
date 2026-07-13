@@ -26,8 +26,8 @@ _DEBUG_FRUSTUM_ZNEAR = 0.01
 
 # self._chunk_max_load_hops (CONFIG_DEFAULTS' "chunk_max_load_hops",
 # sidebar-tunable via the chunk-streaming group's "Max load hops" spinbox)
-# bounds ChunkManager's VRAM/RAM residency to chunks within this many
-# adjacency-graph hops (see renderer/chunk_manager.py's K-NN chunk graph +
+# bounds gs2d.ChunkManager's VRAM/RAM residency to chunks within this many
+# adjacency-graph hops (see gsplat2d_rendering.streaming's own chunk graph +
 # BFS) of the camera's own nearest chunk -- needed because the octree cull's
 # frustum test is deliberately far-clip-less (correct for rendering), but a
 # residency decision needs an actual reach bound, or a chunk manifold that
@@ -41,7 +41,6 @@ _DEBUG_FRUSTUM_ZNEAR = 0.01
 import gsplat2d_rendering as gs2d
 
 from renderer             import ViewerRenderer
-from renderer.chunk_manager import ChunkManager
 from viewer.config        import (
     UP_AXIS_VECTORS,
     RENDER_TYPES, RENDER_TYPE_MAP,
@@ -106,7 +105,7 @@ class LocalViewer(QMainWindow):
         self._chunk_ram_margin_hops  = cfg["chunk_ram_margin_hops"]
         self._chunk_max_load_hops   = cfg["chunk_max_load_hops"]
         self._chunk_prune_opacity_threshold = cfg["chunk_prune_opacity_threshold"]
-        self._chunk_manager: ChunkManager | None = None
+        self._chunk_manager: gs2d.ChunkManager | None = None
 
         # Render resolution / FOV / camera are needed up front (not just for
         # display) — chunk streaming's initial_sync_load below needs a real
@@ -149,9 +148,10 @@ class LocalViewer(QMainWindow):
         self.renderer = ViewerRenderer(
             model, bg,
             # False for chunk streaming: model/octree came from
-            # ChunkManager.initial_sync_load(), already baked into
+            # gs2d.ChunkManager.initial_sync_load(), already baked into
             # leaf-contiguous order per-chunk at read time (see
-            # ChunkManager._ensure_fine_octree) -- do_initialize=True would
+            # gsplat2d_rendering.streaming.FineOctreeCache.ensure) --
+            # do_initialize=True would
             # call update_pc_features() and redundantly reorder an
             # already-ordered model. do_initialize=False still builds the
             # SplatRenderer (via _rebuild_splat_renderer) so rendering works;
@@ -223,15 +223,16 @@ class LocalViewer(QMainWindow):
         self._compress_error_flag = False
 
         # Background chunk-manifest build state (mirrors the two blocks above)
-        self._chunk_build_pending      = None   # ChunkManager, once built/loaded
+        self._chunk_build_pending      = None   # gs2d.ChunkManager, once built/loaded
         self._chunk_build_ready_flag   = False
         self._chunk_build_error_flag   = False
         self._chunk_oom_flag           = False
 
         # Pending chunk-streaming compression-level change -- an int level,
         # or None. Set from the sidebar (Qt thread) but only ever applied
-        # from _render_loop: ChunkManager._vram/_ram are documented as
-        # "mutated only from the render thread", and set_compression() does
+        # from _render_loop: gsplat2d_rendering.streaming.ChunkManager's
+        # resident-chunk dicts are documented as "mutated only from the
+        # render thread", and set_compression() does
         # exactly that (evicts every resident chunk), unlike set_margins'
         # plain attribute swaps, which tolerate being called from either
         # thread under the GIL.
@@ -315,18 +316,21 @@ class LocalViewer(QMainWindow):
     def _load_chunked(self, ply_path: str, args):
         """Chunk-streaming startup path: build/load the manifest + chunk-
         reordered PLY (blocking, same category as today's synchronous
-        --build-index), construct ChunkManager, and load whatever the
-        starting camera pose needs. culling_enabled for the resulting fine
-        octree is always True regardless of --no-culling — chunk residency
-        and per-frame GPU culling are independent concerns (see
-        renderer/chunk_manager.py)."""
+        --build-index), construct gsplat2d_rendering.streaming.ChunkManager,
+        and load whatever the starting camera pose needs. culling_enabled
+        for the resulting fine octree is always True regardless of
+        --no-culling — chunk residency and per-frame GPU culling are
+        independent concerns (chunk streaming itself now lives in the
+        gsplat2d_rendering library, not in Kestrel — see that library's own
+        CLAUDE.md/README for how ChunkManager works internally; this file
+        only owns the .kestrel/ path convention and Qt-thread wiring)."""
         manifest = None if getattr(args, 'build_chunks', False) else _load_chunk_manifest(ply_path)
         if manifest is None:
             self._build_chunks_blocking(ply_path)
             manifest = _load_chunk_manifest(ply_path)
 
         chunked_path = _chunked_ply_path(ply_path)
-        self._chunk_manager = ChunkManager(
+        self._chunk_manager = gs2d.ChunkManager(
             chunked_path, manifest, device=str(self.device),
             vram_margin_hops=self._chunk_vram_margin_hops, ram_margin_hops=self._chunk_ram_margin_hops,
             fine_leaf_max=self._leaf_max, compression_level=self._current_compression,
@@ -338,8 +342,8 @@ class LocalViewer(QMainWindow):
         """Background worker for the sidebar's mid-session 'enable chunk
         streaming' / 'Build/Rebuild Chunk Manifest' actions — mirrors
         _build_index_worker's shape (build if needed, construct
-        ChunkManager, initial_sync_load, all off the render/Qt thread), then
-        hands the ready pieces to _render_loop via _chunk_build_pending.
+        gs2d.ChunkManager, initial_sync_load, all off the render/Qt thread),
+        then hands the ready pieces to _render_loop via _chunk_build_pending.
 
         force=True (the sidebar's explicit "Build/Rebuild" button) skips the
         existing-manifest check entirely: _load_chunk_manifest's staleness
@@ -356,7 +360,7 @@ class LocalViewer(QMainWindow):
                 self._build_chunks_blocking(self.ply_path)
                 manifest = _load_chunk_manifest(self.ply_path)
             chunked_path = _chunked_ply_path(self.ply_path)
-            chunk_manager = ChunkManager(
+            chunk_manager = gs2d.ChunkManager(
                 chunked_path, manifest, device=str(self.device),
                 vram_margin_hops=self._chunk_vram_margin_hops, ram_margin_hops=self._chunk_ram_margin_hops,
                 fine_leaf_max=self._leaf_max, compression_level=self._current_compression,
@@ -610,11 +614,11 @@ class LocalViewer(QMainWindow):
                 del old_model
                 torch.cuda.empty_cache()
                 self.renderer.octree = octree
-                # True, not False: ChunkManager._ensure_fine_octree already
-                # baked this model into its own octree's leaf-contiguous
-                # order per-chunk, at read time -- see that method's
-                # docstring. update_pc_features()'s reorder_() call is a
-                # deliberate no-op here, not a missed reset.
+                # True, not False: gsplat2d_rendering.streaming.
+                # FineOctreeCache.ensure already baked this model into its
+                # own octree's leaf-contiguous order per-chunk, at read time
+                # -- see that method's docstring. update_pc_features()'s
+                # reorder_() call is a deliberate no-op here, not a missed reset.
                 self.renderer._spatially_ordered = True
                 self.renderer.culling_enabled = True
                 self.renderer.update_pc_features()
@@ -673,11 +677,12 @@ class LocalViewer(QMainWindow):
                         old_model = self.renderer.gaussian_model
                         self.renderer.gaussian_model, self.renderer.octree = swap
                         del old_model
-                        # True, not False: ChunkManager hands back a model
-                        # already in its stitched octree's leaf-contiguous
-                        # order (each resident chunk was reordered once, at
-                        # read time, in _ensure_fine_octree) -- the O(total
-                        # composited points) reorder update_pc_features()
+                        # True, not False: gs2d.ChunkManager hands back a
+                        # model already in its stitched octree's leaf-
+                        # contiguous order (each resident chunk was reordered
+                        # once, at read time, in FineOctreeCache.ensure) --
+                        # the O(total composited points) reorder
+                        # update_pc_features()
                         # would otherwise do here, on the render thread,
                         # every time this swap lands (as often as every
                         # rebuild_throttle_s during continuous motion), is a
@@ -731,7 +736,7 @@ class LocalViewer(QMainWindow):
                             color = QColor(80, 220, 80, 200)
                         elif state == "vram_margin":
                             # Adjacency-hop-promoted VRAM residents (see
-                            # renderer/chunk_manager.py's vram_margin_hops) --
+                            # gsplat2d_rendering.streaming's vram_margin_hops) --
                             # a distinct (lime) green from strict "vram"'s
                             # green, per the user's request: still real GPU
                             # residency, just not in the camera's own strict

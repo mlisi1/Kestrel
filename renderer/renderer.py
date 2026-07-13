@@ -109,18 +109,20 @@ class ViewerRenderer:
 
         Load-time chunk streaming (viewer/app.py's chunk-streaming install
         sites) deliberately sets `_spatially_ordered = True` *before* calling
-        this, bypassing the reorder branch entirely — ChunkManager already
-        bakes each resident chunk into its own octree's leaf-contiguous
-        order once, at read time (renderer/chunk_manager.py::ChunkManager.
-        _ensure_fine_octree), so the composited model it hands back is
-        already in the order this method would otherwise spend an
-        O(total composited points) reorder deriving from scratch on every
-        single rebuild. This is intentional, not a bug to "fix" back to
-        False — see that method's docstring for the full reasoning."""
+        this, bypassing the reorder branch entirely — gsplat2d_rendering.
+        streaming.ChunkManager already bakes each resident chunk into its
+        own octree's leaf-contiguous order once, at read time (that
+        library's `FineOctreeCache.ensure`), so the composited model it
+        hands back is already in the order this method would otherwise
+        spend an O(total composited points) reorder deriving from scratch
+        on every single rebuild. This is intentional, not a bug to "fix"
+        back to False — see that library method's docstring for the full
+        reasoning; chunk streaming itself is no longer Kestrel's own code."""
         if self.octree is not None and not self._spatially_ordered:
             # flat_indices is already int64 by construction (build_octree
-            # always produces it via .astype(np.int64), and _stitch_fine_octree
-            # preserves that dtype through concatenation/offsetting) -- the
+            # always produces it via .astype(np.int64), and streaming.
+            # FineOctreeCache.stitch preserves that dtype through
+            # concatenation/offsetting) -- the
             # .astype("int64") that used to be here was a needless full-array
             # copy (numpy's astype() copies unconditionally unless told not
             # to, even when the dtype already matches): measured ~23ms vs

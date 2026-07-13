@@ -19,9 +19,9 @@ Produces, alongside the .ply, under .kestrel/:
 
 Unlike utils/build_index.py (which writes its .idx beside the source .ply),
 this always writes under .kestrel/ — chunk streaming's runtime path
-(renderer/chunk_manager.py, via viewer/ply_loader.py's path helpers) looks
-for the manifest there, the same place the app's own --build-index flag
-already writes the fine-grained index.
+(gsplat2d_rendering.streaming.ChunkManager, via viewer/ply_loader.py's path
+helpers) looks for the manifest there, the same place the app's own
+--build-index flag already writes the fine-grained index.
 
 Chunk partitioning itself is gsplat2d_rendering.build_octree, called with a
 coarse leaf_max (target splats/chunk); this script only owns the Kestrel

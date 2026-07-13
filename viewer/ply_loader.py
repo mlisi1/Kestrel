@@ -9,7 +9,6 @@ compression worker relies on (see viewer/app.py).
 
 from __future__ import annotations
 
-import dataclasses
 import json
 import os
 
@@ -141,16 +140,10 @@ def _model_to_cuda(model):
     """Moves a CPU-loaded GaussianModel's tensors to CUDA, returning a new
     instance. Used to keep PLY parsing (background thread) separate from CUDA
     tensor creation (render thread) — see viewer/app.py's _compression_worker
-    / _render_loop split."""
-    return dataclasses.replace(
-        model,
-        xyz=model.xyz.cuda(),
-        raw_opacity=model.raw_opacity.cuda(),
-        raw_scaling=model.raw_scaling.cuda(),
-        raw_rotation=model.raw_rotation.cuda(),
-        features_dc=model.features_dc.cuda(),
-        features_rest=model.features_rest.cuda(),
-    )
+    / _render_loop split. Thin wrapper over gsplat2d_rendering.GaussianModel.to
+    (added to the library alongside chunk streaming's move there, which had
+    its own private copy of this exact same field-by-field device move)."""
+    return model.to("cuda")
 
 
 # ── Per-model persistent config ───────────────────────────────────────────────
