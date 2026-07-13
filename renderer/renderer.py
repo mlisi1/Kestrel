@@ -29,8 +29,6 @@ here with an O(N) per-frame scale-tensor rewrite.
 """
 from __future__ import annotations
 
-import gc
-
 import matplotlib.pyplot as plt
 import torch
 import torch.nn.functional as F
@@ -107,10 +105,29 @@ class ViewerRenderer:
         their summary lines through VERBOSE instead of NORMAL — pass True
         for a caller that invokes this repeatedly (chunk streaming's
         per-rebuild swap install), leave False for a one-off call (model
-        load, compression switch) that's worth NORMAL-level visibility."""
+        load, compression switch) that's worth NORMAL-level visibility.
+
+        Load-time chunk streaming (viewer/app.py's chunk-streaming install
+        sites) deliberately sets `_spatially_ordered = True` *before* calling
+        this, bypassing the reorder branch entirely — ChunkManager already
+        bakes each resident chunk into its own octree's leaf-contiguous
+        order once, at read time (renderer/chunk_manager.py::ChunkManager.
+        _ensure_fine_octree), so the composited model it hands back is
+        already in the order this method would otherwise spend an
+        O(total composited points) reorder deriving from scratch on every
+        single rebuild. This is intentional, not a bug to "fix" back to
+        False — see that method's docstring for the full reasoning."""
         if self.octree is not None and not self._spatially_ordered:
+            # flat_indices is already int64 by construction (build_octree
+            # always produces it via .astype(np.int64), and _stitch_fine_octree
+            # preserves that dtype through concatenation/offsetting) -- the
+            # .astype("int64") that used to be here was a needless full-array
+            # copy (numpy's astype() copies unconditionally unless told not
+            # to, even when the dtype already matches): measured ~23ms vs
+            # ~3ms on a 7.19M-point octree, a real chunk of the periodic
+            # rebuild-install cost during continuous camera motion.
             perm = torch.from_numpy(
-                self.octree.flat_indices.astype("int64")
+                self.octree.flat_indices
             ).to(self.gaussian_model.xyz.device)
             self.gaussian_model.reorder_(perm, verbose_log=verbose_log)
             del perm
@@ -138,30 +155,29 @@ class ViewerRenderer:
             with_extras=True,
             verbose_log=verbose_log,
         )
-        # Explicit del + gc.collect() + empty_cache. The del alone is *not*
-        # enough: SplatRenderer.__init__ does `self.profiler =
-        # Profiler(sync_fn=self._sync)`, and self._sync is a bound method
-        # holding a reference back to the SplatRenderer instance itself --
-        # a genuine reference cycle (SplatRenderer -> profiler -> sync_fn ->
-        # SplatRenderer). Verified directly: with Python's automatic cyclic
-        # GC disabled, a SplatRenderer instance survives `del` entirely
-        # (still alive per a weakref check) until gc.collect() runs --
-        # refcounting alone can never free an object that's part of a
-        # cycle. Without the explicit collect() here, dead-but-uncollected
-        # instances (and the GPU tensors they still reference, including
-        # the *old* composited model, not just octree AABBs) pile up
-        # faster than Python's generational GC happens to run on its own,
-        # which is exactly what one-off calls (model load, compression
-        # switch) never do enough times to expose, but chunk streaming does
-        # every rebuild_throttle_s during continuous motion. Confirmed via
-        # torch.cuda.memory_allocated() tracing: reserved *and allocated*
-        # memory both climbed steadily even at an identical, unchanged
-        # composition across many rebuild cycles, until this collect() was
-        # added. gc.collect() must run before empty_cache() -- it's what
-        # actually drops the last reference and frees the tensors;
-        # empty_cache() only returns already-free blocks to the driver.
+        # Explicit del + empty_cache. SplatRenderer used to hold a reference
+        # cycle (its Profiler's sync_fn was a bound method pointing back to
+        # the SplatRenderer instance itself), which meant plain `del` could
+        # never free it via refcounting alone -- only Python's cyclic GC
+        # could, and only whenever it happened to run. That's now fixed at
+        # the source in gsplat2d_rendering (rasterizer.py's sync_fn closes
+        # over the device string instead of `self`), so `del` here is
+        # sufficient on its own -- verified directly with the automatic
+        # cyclic GC fully disabled. (Two earlier attempts at working around
+        # this from the Kestrel side instead -- an explicit full gc.collect(),
+        # then a cheaper gc.collect(0) -- are gone: the full collect() walked
+        # every tracked object across all 3 generations and measured
+        # ~21-24ms of a ~35-38ms total rebuild-install cost on this scene's
+        # full 7.19M-point model; gc.collect(0) was faster but unreliable,
+        # since a cycle can get promoted out of generation 0 by an unrelated
+        # automatic collection -- e.g. triggered by chunk streaming's own
+        # background transition-worker allocations -- before this explicit
+        # call ever runs, and gc.collect(0) then can't see it. Both were
+        # real, measured causes of "chunk streaming is slower than no
+        # streaming, even at a steady swipe" once the VRAM-correctness fix
+        # was in place; fixing the cycle at its root removes the need for
+        # either.)
         del old_splat_renderer
-        gc.collect()
         torch.cuda.empty_cache()
         # Not exposed as a constructor/render() param on SplatRenderer —
         # background is a plain mutable instance attribute there, so this is

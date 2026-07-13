@@ -29,28 +29,52 @@ coarse leaf_max (target splats/chunk); this script only owns the Kestrel
 """
 
 import argparse
+import json
 import os
 
 import torch
 
 import gsplat2d_rendering as gs2d
-from utils.build_index import read_xyz
-from viewer.ply_loader import _chunk_manifest_path, _chunked_ply_path
+from viewer.ply_loader import _chunk_manifest_path, _chunk_meta_path, _chunked_ply_path, _ply_vertex_count
 
 CHUNK_MAX_DEPTH  = 6
 CHUNK_TARGET_SIZE = 500_000   # target splats per chunk
 
 
 def build_chunks(ply_path: str, chunk_size: int = CHUNK_TARGET_SIZE,
-                  max_depth: int = CHUNK_MAX_DEPTH) -> None:
+                  max_depth: int = CHUNK_MAX_DEPTH,
+                  opacity_threshold: float = 0.0) -> None:
+    """opacity_threshold (default 0.0, off) permanently drops splats at/under
+    this activated opacity before chunking -- same semantics as
+    load_gaussian_model's own parameter (see its docstring: real floater
+    artifacts in trained models can sit at mean opacity ~0.003-0.004,
+    correctly isolated by the adaptive split into their own chunk since they
+    don't spatially cluster with real geometry -- a chunk that's nonempty by
+    point count but renders as visually nothing). Must happen here, before
+    build_octree ever runs, not as a per-read parameter at runtime: pruning
+    changes which rows exist at all, so the chunk octree's indices would
+    desync from what's actually written if it ran any later -- same
+    reasoning as ChunkedPlyReader/load_gaussian_model_range's own opacity
+    parameter being build-time-only, not exposed per range read."""
     manifest_path = _chunk_manifest_path(ply_path)
     chunked_path  = _chunked_ply_path(ply_path)
+    meta_path     = _chunk_meta_path(ply_path)
     os.makedirs(os.path.dirname(manifest_path), exist_ok=True)
 
-    xyz = read_xyz(ply_path)
+    # Recorded before pruning: the *source* PLY's own row count, independent
+    # of whatever opacity_threshold does to what's actually written below --
+    # see _load_chunk_manifest's own docstring for why viewer/ply_loader.py's
+    # staleness check needs this instead of comparing the (possibly now much
+    # smaller, pruned) manifest's point count directly against the source.
+    source_point_count = _ply_vertex_count(ply_path)
+
+    # xyz is derived from the (possibly pruned) loaded model rather than a
+    # separate read of the raw file, so the octree's point count/indices
+    # always match what write_gaussian_model actually writes below.
+    model = gs2d.load_gaussian_model(ply_path, device="cpu", opacity_threshold=opacity_threshold)
+    xyz = model.xyz.float().cpu().numpy()
     chunk_octree = gs2d.build_octree(xyz, leaf_max=chunk_size, max_depth=max_depth)
 
-    model = gs2d.load_gaussian_model(ply_path, device="cpu")
     model.reorder_(torch.from_numpy(chunk_octree.flat_indices.astype("int64")))
     gs2d.write_gaussian_model(chunked_path, model)
 
@@ -59,6 +83,9 @@ def build_chunks(ply_path: str, chunk_size: int = CHUNK_TARGET_SIZE,
     # silently append ".npz" to it.
     with open(manifest_path, "wb") as fh:
         gs2d.save_octree(fh, chunk_octree)
+
+    with open(meta_path, "w") as fh:
+        json.dump({"source_point_count": source_point_count, "opacity_threshold": opacity_threshold}, fh)
 
 
 def main():
@@ -70,6 +97,11 @@ def main():
                         help=f"Target splats per chunk (default {CHUNK_TARGET_SIZE:,})")
     parser.add_argument("--max-depth", type=int, default=CHUNK_MAX_DEPTH,
                         help=f"Max octree depth when partitioning into chunks (default {CHUNK_MAX_DEPTH})")
+    parser.add_argument("--opacity-threshold", type=float, default=0.0,
+                        help="Permanently drop splats at/under this activated opacity before "
+                             "chunking (default 0.0, off). Eliminates near-invisible floater "
+                             "artifacts that the adaptive split would otherwise isolate into "
+                             "their own chunk (nonempty by point count, empty-looking on screen).")
     parser.add_argument("--verbosity", type=int, choices=[0, 1, 2], default=2,
                         help="gsplat2d_rendering log verbosity: 0=silent (errors only), "
                              "1=normal, 2=verbose (default, since this is an offline tool "
@@ -77,7 +109,8 @@ def main():
     args = parser.parse_args()
 
     gs2d.set_verbosity(args.verbosity)
-    build_chunks(args.ply_path, chunk_size=args.chunk_size, max_depth=args.max_depth)
+    build_chunks(args.ply_path, chunk_size=args.chunk_size, max_depth=args.max_depth,
+                 opacity_threshold=args.opacity_threshold)
 
 
 if __name__ == "__main__":

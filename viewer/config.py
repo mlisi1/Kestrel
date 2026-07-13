@@ -102,8 +102,25 @@ CONFIG_DEFAULTS: dict = {
     "verbosity":          1,       # gsplat2d_rendering log level: 0=silent, 1=normal, 2=verbose
     "chunk_streaming_enabled": False,   # off by default -- see renderer/chunk_manager.py
     "chunk_target_size":       500_000, # target splats/chunk, same UX as octree "Leaf size"
-    "chunk_hybrid_enabled":    False,   # RAM-buffer prefetch tier around the frustum
-    "chunk_margin":            0.0,     # world-space AABB-expansion distance for the RAM tier
+    # Adjacency-hop-count residency (renderer/chunk_manager.py's K-NN chunk
+    # graph + BFS), replacing an earlier world-space-distance design. All
+    # three are integers; 0 means "off" for either margin, no separate
+    # enable/disable flag needed (same idiom as chunk_size=0 elsewhere).
+    "chunk_vram_margin_hops": 0, # adjacency hops beyond the strict frustum that are ALSO
+                                 # promoted to actual VRAM residency (cheap per-frame GPU
+                                 # culling then hides/shows them, no rebuild needed)
+    "chunk_ram_margin_hops":  0, # adjacency hops beyond the VRAM tier that are CPU-only
+                                 # prefetched (was "chunk_margin", a world-space float)
+    "chunk_max_load_hops":    3, # overall residency reach bound: no chunk more than this
+                                 # many adjacency-hops from the camera's own nearest chunk
+                                 # is ever considered, regardless of the frustum test result
+                                 # (was "chunk_max_load_distance_mult", a camera.distance
+                                 # multiplier) -- sidebar-tunable (Chunk Streaming panel)
+    "chunk_prune_opacity_threshold": 0.0, # permanently drops splats at/under this opacity at the
+                                          # *next* chunk manifest rebuild (utils/build_chunks.py's
+                                          # opacity_threshold) -- separate from the live, per-frame
+                                          # "Opacity threshold" render slider (opacity_thresh)
+                                          # above, which never touches the chunk manifest at all
 }
 
 

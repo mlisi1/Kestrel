@@ -112,40 +112,93 @@ class Sidebar:
         self._chunk_enable_cb.toggled.connect(self._on_chunk_streaming_toggled)
 
         self._chunk_size_spin = QSpinBox()
-        self._chunk_size_spin.setRange(10_000, 5_000_000)
+        # 0 (split as finely as --max-depth allows) to Qt's own QSpinBox
+        # ceiling (2**31-1, a C int under the hood) -- no Kestrel-imposed cap
+        # beyond that: a target at or above the model's own point count
+        # collapses the whole scene into a single chunk (the root node
+        # already satisfies indices.size <= leaf_max), which is a valid,
+        # well-defined way to turn chunking off without a separate toggle.
+        self._chunk_size_spin.setRange(0, 2_147_483_647)
         self._chunk_size_spin.setSingleStep(50_000)
         self._chunk_size_spin.setValue(self.v._chunk_target_size)
         self._chunk_size_spin.setToolTip(
             "Target splats per disk chunk -- same idea as Frustum Culling's "
             "'Leaf size', just at disk-chunk granularity. No universally "
-            "correct value; scene-dependent. Takes effect on the next "
-            "Build/Rebuild Chunk Manifest."
+            "correct value; scene-dependent. 0 splits as finely as possible; "
+            "a value at/above the model's point count collapses it to one "
+            "chunk. Takes effect on the next Build/Rebuild Chunk Manifest."
         )
         self._chunk_size_spin.valueChanged.connect(lambda v: setattr(self.v, '_chunk_target_size', v))
 
-        self._chunk_hybrid_cb = QCheckBox("Prefetch margin")
-        self._chunk_hybrid_cb.setChecked(self.v._chunk_hybrid_enabled)
-        self._chunk_hybrid_cb.toggled.connect(self._on_chunk_hybrid_toggled)
-
-        self._chunk_margin_spin = QDoubleSpinBox()
-        self._chunk_margin_spin.setLocale(QLocale(QLocale.C))
-        self._chunk_margin_spin.setRange(0.0, 100.0)
-        self._chunk_margin_spin.setDecimals(2)
-        self._chunk_margin_spin.setSingleStep(0.5)
-        self._chunk_margin_spin.setValue(self.v._chunk_margin)
-        self._chunk_margin_spin.setToolTip(
-            "World-space prefetch margin around the frustum (RAM-buffer tier) "
-            "-- same scale as the Crop Box sliders. 0 disables the hybrid tier."
+        self._chunk_vram_margin_spin = QSpinBox()
+        self._chunk_vram_margin_spin.setRange(0, 20)
+        self._chunk_vram_margin_spin.setValue(self.v._chunk_vram_margin_hops)
+        self._chunk_vram_margin_spin.setToolTip(
+            "Adjacency hops beyond the camera's strict frustum that are ALSO "
+            "promoted to actual VRAM residency (cheap per-frame GPU culling "
+            "then hides/shows them, no rebuild needed) -- drawn in a distinct "
+            "green in the dual-camera-debug chunk overlay. 0 disables this "
+            "margin. Applied live, no rebuild needed."
         )
-        self._chunk_margin_spin.valueChanged.connect(self._on_chunk_margin_changed)
+        self._chunk_vram_margin_spin.valueChanged.connect(self._on_chunk_vram_margin_changed)
+
+        self._chunk_ram_margin_spin = QSpinBox()
+        self._chunk_ram_margin_spin.setRange(0, 20)
+        self._chunk_ram_margin_spin.setValue(self.v._chunk_ram_margin_hops)
+        self._chunk_ram_margin_spin.setToolTip(
+            "Adjacency hops beyond the VRAM tier (strict + VRAM margin) that "
+            "are CPU-only prefetched (RAM tier) -- for any VRAM-resident "
+            "chunk, its neighbors out to this many hops are RAM-buffered. "
+            "0 disables the RAM tier. Applied live, no rebuild needed."
+        )
+        self._chunk_ram_margin_spin.valueChanged.connect(self._on_chunk_ram_margin_changed)
+
+        self._chunk_max_load_hops_spin = QSpinBox()
+        self._chunk_max_load_hops_spin.setRange(0, 50)
+        self._chunk_max_load_hops_spin.setValue(self.v._chunk_max_load_hops)
+        self._chunk_max_load_hops_spin.setToolTip(
+            "Overall residency reach bound: no chunk more than this many "
+            "adjacency-hops from the camera's own nearest chunk is ever "
+            "considered, regardless of the frustum test result -- needed "
+            "since the octree cull's own frustum test has no far-plane clip "
+            "(see CLAUDE.md), so a chunk aligned with the camera's view "
+            "direction could otherwise span the whole scene regardless of "
+            "true distance. Raise this if large scenes stop loading chunks "
+            "that should still be visible; lower it if VRAM/RAM residency "
+            "balloons during rotation. Applied live, no rebuild needed."
+        )
+        self._chunk_max_load_hops_spin.valueChanged.connect(
+            lambda v: setattr(self.v, '_chunk_max_load_hops', v))
+
+        self._chunk_prune_opacity_spin = QDoubleSpinBox()
+        self._chunk_prune_opacity_spin.setLocale(QLocale(QLocale.C))
+        self._chunk_prune_opacity_spin.setRange(0.0, 1.0)
+        self._chunk_prune_opacity_spin.setDecimals(4)
+        self._chunk_prune_opacity_spin.setSingleStep(0.005)
+        self._chunk_prune_opacity_spin.setValue(self.v._chunk_prune_opacity_threshold)
+        self._chunk_prune_opacity_spin.setToolTip(
+            "Permanently drops splats at/under this activated opacity the *next* "
+            "time you click Build/Rebuild Chunk Manifest below -- this is NOT the "
+            "same as the live 'Opacity threshold' render slider in Status/Render "
+            "above, which never touches the chunk manifest and needs no rebuild. "
+            "Eliminates near-invisible floater artifacts that the adaptive split "
+            "would otherwise isolate into their own chunk (nonempty by point "
+            "count, empty-looking on screen). 0 = off. Real scenes can have far "
+            "more near-zero-opacity points than visible ones -- even a small "
+            "value can prune the majority of splats; there's no universal default."
+        )
+        self._chunk_prune_opacity_spin.valueChanged.connect(
+            lambda v: setattr(self.v, '_chunk_prune_opacity_threshold', v))
 
         self._chunk_build_btn = QPushButton("Build/Rebuild Chunk Manifest")
         self._chunk_build_btn.clicked.connect(self._on_chunk_build_clicked)
 
         f.addRow("Enable:", self._chunk_enable_cb)
         f.addRow("Chunk size:", self._chunk_size_spin)
-        f.addRow(self._chunk_hybrid_cb)
-        f.addRow("Margin:", self._chunk_margin_spin)
+        f.addRow("VRAM margin (hops):", self._chunk_vram_margin_spin)
+        f.addRow("RAM margin (hops):", self._chunk_ram_margin_spin)
+        f.addRow("Max load hops:", self._chunk_max_load_hops_spin)
+        f.addRow("Prune opacity ≤:", self._chunk_prune_opacity_spin)
         f.addRow("Status:", self._chunk_status_label)
         f.addRow("Resident:", self._chunk_stats_label)
         f.addRow(self._chunk_build_btn)
@@ -403,13 +456,13 @@ class Sidebar:
         self._chunk_status_label.setStyleSheet("color: #66cc66;")
         self.update_chunk_stats(*self.v._chunk_manager.stats())
 
-    def _start_chunk_build(self):
+    def _start_chunk_build(self, force: bool = False):
         self._chunk_build_btn.setEnabled(False)
         self._chunk_enable_cb.setEnabled(False)
         self._chunk_status_label.setText("Building chunk manifest...")
         self._chunk_status_label.setStyleSheet("color: #aaaaaa;")
         self._chunk_progress.show()
-        threading.Thread(target=self.v._chunk_build_worker, daemon=True).start()
+        threading.Thread(target=self.v._chunk_build_worker, args=(force,), daemon=True).start()
 
     def _on_chunk_streaming_toggled(self, enabled: bool):
         self.v._chunk_streaming_enabled = enabled
@@ -426,29 +479,51 @@ class Sidebar:
             return
         self._start_chunk_build()
 
-    def _on_chunk_hybrid_toggled(self, enabled: bool):
-        self.v._chunk_hybrid_enabled = enabled
+    def _on_chunk_vram_margin_changed(self, val: int):
+        self.v._chunk_vram_margin_hops = val
         if self.v._chunk_manager is not None:
-            self.v._chunk_manager.set_hybrid(enabled, self.v._chunk_margin)
+            self.v._chunk_manager.set_margins(val, self.v._chunk_ram_margin_hops)
 
-    def _on_chunk_margin_changed(self, val: float):
-        self.v._chunk_margin = val
+    def _on_chunk_ram_margin_changed(self, val: int):
+        self.v._chunk_ram_margin_hops = val
         if self.v._chunk_manager is not None:
-            self.v._chunk_manager.set_hybrid(self.v._chunk_hybrid_enabled, val)
+            self.v._chunk_manager.set_margins(self.v._chunk_vram_margin_hops, val)
 
     def _on_chunk_build_clicked(self):
-        self._start_chunk_build()
+        # force=True: an explicit click always rebuilds with whatever chunk
+        # size is currently in the spinbox, even if a manifest already
+        # exists -- see _start_chunk_build/_chunk_build_worker's own
+        # docstring for why the default (reuse-if-valid) path would
+        # otherwise silently ignore a changed chunk-size target.
+        self._start_chunk_build(force=True)
 
     # ── compression callback ───────────────────────────────────────────────────
 
     def _on_compression_changed(self, index: int):
         if index == self.v._current_compression:
             return
+        label = COMPRESSION_LABELS[index].split(' — ')[0]
+
+        if self.v._chunk_manager is not None and self.v._chunk_streaming_enabled:
+            # Chunk streaming's own compression path: gsplat2d_rendering's
+            # in-memory compression_level applied per chunk read (see
+            # ChunkManager._read_chunk/set_compression) -- no offline file,
+            # no background worker needed, so this doesn't reuse
+            # _start_compression's whole-file "Compressing..."/progress-bar
+            # flow at all. The actual dict eviction only runs on the render
+            # thread (_render_loop drains _chunk_compression_pending), but
+            # that's near-instant; resident chunks re-read at the new level
+            # over the next few frames via the normal transition machinery,
+            # same as any other chunk pop-in.
+            self.v._chunk_compression_pending = index
+            self._compression_status_label.setText(f"Reloading chunks at {label}...")
+            self._compression_status_label.setStyleSheet("color: #aaaaaa;")
+            return
+
         self._compression_combo.setEnabled(False)
-        label = COMPRESSION_LABELS[index]
         action = ("Loading" if index == 0 or os.path.exists(
             _compressed_ply_path(self.v.ply_path, index)) else "Compressing")
-        self._compression_status_label.setText(f"{action} {label.split(' — ')[0]}...")
+        self._compression_status_label.setText(f"{action} {label}...")
         self._compression_status_label.setStyleSheet("color: #aaaaaa;")
         self._compress_progress.show()
         self.v._start_compression(index)
@@ -561,6 +636,23 @@ class Sidebar:
         self._compression_combo.setCurrentIndex(level)
         self._compression_combo.blockSignals(False)
         self._compress_progress.hide()
+
+    def on_chunk_compression_applied(self, level: int):
+        """Fires once ChunkManager.set_compression() has run (near-instant --
+        just evicting resident chunks), not once resident chunks have
+        actually finished re-reading at the new level -- that happens
+        gradually over the next few frames via the normal transition
+        machinery, same as any other chunk pop-in, with no separate
+        completion signal of its own. Unlike on_ply_loaded, the SH-degree
+        spinbox's cap isn't touched here: the new degree isn't known yet
+        (nothing's been read at the new level at this point), and
+        ViewerRenderer.update_pc_features() already recomputes it from
+        whatever composited model actually lands, on the next rebuild."""
+        self._compression_status_label.setText(f"L{level} active (chunks reloading)")
+        self._compression_status_label.setStyleSheet("color: #66cc66;")
+        self._compression_combo.blockSignals(True)
+        self._compression_combo.setCurrentIndex(level)
+        self._compression_combo.blockSignals(False)
 
     def on_compress_error(self, current_level: int):
         self._compression_status_label.setText("Failed — see console")

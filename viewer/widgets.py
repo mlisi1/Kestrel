@@ -14,6 +14,15 @@ from PyQt5.QtWidgets import QLabel, QSizePolicy
 
 from viewer.config import fmt_splats
 
+# Fixed FPS-graph scale tiers (0-60 default) instead of a per-frame moving
+# scale keyed to the recent peak -- a moving scale made the graph itself
+# jump around on top of the FPS jitter it was meant to help read. Widens one
+# tier at a time, and only once FPS has stayed *consistently* above the
+# current tier's ceiling for _FPS_SCALE_STREAK_FRAMES consecutive frames (a
+# single spike doesn't count) -- never narrows back down mid-session.
+_FPS_SCALE_TIERS = (60, 120, 320)
+_FPS_SCALE_STREAK_FRAMES = 60
+
 
 class RenderWidget(QLabel):
     """
@@ -39,6 +48,8 @@ class RenderWidget(QLabel):
         self._btns             = set()
         self._fps_history      = collections.deque(maxlen=90)
         self._splat_history    = collections.deque(maxlen=90)
+        self._fps_scale_tier_idx    = 0   # index into _FPS_SCALE_TIERS
+        self._fps_above_scale_streak = 0  # consecutive frames above the current tier
         self._show_fps_overlay   = True
         self._show_splat_overlay = True
         self._no_culling_warning = False
@@ -120,7 +131,25 @@ class RenderWidget(QLabel):
 
     def update_fps(self, fps: float):
         self._fps_history.append(fps)
+
+        current_ceiling = _FPS_SCALE_TIERS[self._fps_scale_tier_idx]
+        if fps > current_ceiling:
+            self._fps_above_scale_streak += 1
+        else:
+            self._fps_above_scale_streak = 0
+        if (self._fps_above_scale_streak >= _FPS_SCALE_STREAK_FRAMES
+                and self._fps_scale_tier_idx < len(_FPS_SCALE_TIERS) - 1):
+            self._fps_scale_tier_idx += 1
+            self._fps_above_scale_streak = 0
+
         self.update()
+
+    def average_fps(self) -> float:
+        """Mean over the same rolling window the graph plots -- smooths out
+        the frame-to-frame jitter a single instantaneous reading shows."""
+        if not self._fps_history:
+            return 0.0
+        return sum(self._fps_history) / len(self._fps_history)
 
     def update_splat_count(self, n: int):
         self._splat_history.append(n)
@@ -198,9 +227,7 @@ class RenderWidget(QLabel):
         vals = list(self._fps_history)
         current_fps = vals[-1] if vals else 0.0
 
-        peak = max(vals) if vals else 30.0
-        y_max = float(next((n for n in (30, 60, 90, 120, 144, 240)
-                            if n >= peak * 0.8), 240))
+        y_max = float(_FPS_SCALE_TIERS[self._fps_scale_tier_idx])
 
         gx = float(ox + PAD_L)
         gy = float(oy + PAD_T)

@@ -51,6 +51,17 @@ def _chunked_ply_path(ply_path: str) -> str:
     return os.path.join(d, ".kestrel", f"{stem}_chunked.ply")
 
 
+def _chunk_meta_path(ply_path: str) -> str:
+    """<iteration_dir>/.kestrel/<ply_stem>_chunks_meta.json -- tiny sidecar
+    recording the *source* PLY's row count at the time the chunk manifest
+    was last built (see _load_chunk_manifest's own docstring for why this
+    can no longer be derived from the manifest's own point count once
+    opacity pruning is in play)."""
+    d = os.path.dirname(os.path.abspath(ply_path))
+    stem = os.path.splitext(os.path.basename(ply_path))[0]
+    return os.path.join(d, ".kestrel", f"{stem}_chunks_meta.json")
+
+
 # ── Octree index ──────────────────────────────────────────────────────────────
 
 def _load_octree(ply_path: str):
@@ -75,16 +86,36 @@ def _ply_vertex_count(path: str) -> int:
 
 def _load_chunk_manifest(ply_path: str):
     """Returns the coarse chunk-manifest Octree (see utils/build_chunks.py),
-    or None if missing or stale. Stale means the manifest's total point
-    count no longer matches the source PLY's -- mirrors
+    or None if missing or stale.
+
+    Stale means the *source* PLY's row count no longer matches what it was
+    when this manifest was last built -- read from the _chunk_meta_path
+    sidecar utils/build_chunks.py writes alongside the manifest, not derived
+    by comparing the manifest's own point count against the source file's
+    current count. Those two used to be interchangeable (mirroring
     gsplat2d_rendering.culling.cache.load_or_build_octree's own stale-cache
-    guard, just against Kestrel's own .kestrel/ path convention instead of
-    that helper's .gsplat2d_rendering/ cache dir."""
+    guard), but opacity-threshold pruning (utils/build_chunks.py
+    --opacity-threshold) deliberately makes the chunk manifest's point count
+    *smaller* than the source PLY's by design -- comparing them directly
+    would flag every legitimately-pruned manifest as stale immediately after
+    building it. Falls back to the old direct comparison if the sidecar is
+    missing (a manifest built before this fix existed), which is only ever
+    wrong in the specific case of an old, unpruned manifest sitting next to
+    a freshly-pruned source -- itself just a one-time forced rebuild, not a
+    correctness issue."""
     manifest_path = _chunk_manifest_path(ply_path)
     if not os.path.exists(manifest_path):
         return None
     manifest = gs2d.load_octree(manifest_path)
-    if int(manifest.node_offsets[-1]) != _ply_vertex_count(ply_path):
+
+    meta_path = _chunk_meta_path(ply_path)
+    current_count = _ply_vertex_count(ply_path)
+    if os.path.exists(meta_path):
+        with open(meta_path, "r") as fh:
+            recorded_source_count = json.load(fh).get("source_point_count")
+        if recorded_source_count != current_count:
+            return None
+    elif int(manifest.node_offsets[-1]) != current_count:
         return None
     return manifest
 

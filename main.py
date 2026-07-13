@@ -45,10 +45,15 @@ def _make_parser() -> argparse.ArgumentParser:
     p.add_argument("--chunk-size",   type=int, default=None,
                    help="Target splats per disk chunk. Omit to use the saved "
                         "default (500,000 if never set)")
-    p.add_argument("--chunk-margin", type=float, default=None,
-                   help="World-space prefetch margin (RAM-buffer tier) around the "
-                        "frustum; 0 disables the hybrid RAM tier. Omit to use the "
+    p.add_argument("--chunk-ram-margin-hops", type=int, default=None,
+                   help="Adjacency hops beyond the VRAM tier that are CPU-only "
+                        "prefetched; 0 disables the RAM tier. Omit to use the "
                         "saved default")
+    p.add_argument("--chunk-vram-margin-hops", type=int, default=None,
+                   help="Adjacency hops beyond the strict frustum that are also "
+                        "promoted to actual VRAM residency (cheap per-frame GPU "
+                        "culling hides/shows them, no rebuild needed); 0 disables "
+                        "this margin. Omit to use the saved default")
     p.add_argument("--build-chunks", action="store_true", default=False,
                    help="Build (or rebuild) the chunk manifest + chunk-reordered PLY "
                         "before opening the viewer")
