@@ -37,6 +37,21 @@ def _make_parser() -> argparse.ArgumentParser:
                    help="Debug mode: a second, mouse-orbit-controlled camera "
                         "you can Tab into, for auditing what the keyboard-"
                         "controlled render camera's frustum selects")
+    p.add_argument("--chunk-streaming", action="store_true", default=False,
+                   help="Force-enable load-time chunk streaming for this session "
+                        "(only splats near the camera frustum are kept resident in "
+                        "RAM/VRAM, the rest stay on disk); omit to use the saved "
+                        "default (also toggleable live from the sidebar)")
+    p.add_argument("--chunk-size",   type=int, default=None,
+                   help="Target splats per disk chunk. Omit to use the saved "
+                        "default (500,000 if never set)")
+    p.add_argument("--chunk-margin", type=float, default=None,
+                   help="World-space prefetch margin (RAM-buffer tier) around the "
+                        "frustum; 0 disables the hybrid RAM tier. Omit to use the "
+                        "saved default")
+    p.add_argument("--build-chunks", action="store_true", default=False,
+                   help="Build (or rebuild) the chunk manifest + chunk-reordered PLY "
+                        "before opening the viewer")
     return p
 
 

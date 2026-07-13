@@ -53,6 +53,7 @@ class Sidebar:
         w   = QWidget()
         vbl = QVBoxLayout(w); vbl.setContentsMargins(4, 4, 4, 4)
         self._build_culling_group(vbl)
+        self._build_chunk_streaming_group(vbl)
         self._build_compression_group(vbl)
         self._build_status_group(vbl)
         self._build_camera_group(vbl)
@@ -97,6 +98,60 @@ class Sidebar:
             f.addRow("Leaf size:", self._leaf_max_spin)
             f.addRow(self._build_idx_btn)
         f.addRow(self._culling_progress)
+        vbl.addWidget(g)
+
+    def _build_chunk_streaming_group(self, vbl: QVBoxLayout):
+        g, f = self._group("Chunk Streaming")
+
+        self._chunk_status_label = QLabel()
+        self._chunk_stats_label  = QLabel("--")
+        self._chunk_progress     = self._progress_bar()
+
+        self._chunk_enable_cb = QCheckBox()
+        self._chunk_enable_cb.setChecked(self.v._chunk_streaming_enabled)
+        self._chunk_enable_cb.toggled.connect(self._on_chunk_streaming_toggled)
+
+        self._chunk_size_spin = QSpinBox()
+        self._chunk_size_spin.setRange(10_000, 5_000_000)
+        self._chunk_size_spin.setSingleStep(50_000)
+        self._chunk_size_spin.setValue(self.v._chunk_target_size)
+        self._chunk_size_spin.setToolTip(
+            "Target splats per disk chunk -- same idea as Frustum Culling's "
+            "'Leaf size', just at disk-chunk granularity. No universally "
+            "correct value; scene-dependent. Takes effect on the next "
+            "Build/Rebuild Chunk Manifest."
+        )
+        self._chunk_size_spin.valueChanged.connect(lambda v: setattr(self.v, '_chunk_target_size', v))
+
+        self._chunk_hybrid_cb = QCheckBox("Prefetch margin")
+        self._chunk_hybrid_cb.setChecked(self.v._chunk_hybrid_enabled)
+        self._chunk_hybrid_cb.toggled.connect(self._on_chunk_hybrid_toggled)
+
+        self._chunk_margin_spin = QDoubleSpinBox()
+        self._chunk_margin_spin.setLocale(QLocale(QLocale.C))
+        self._chunk_margin_spin.setRange(0.0, 100.0)
+        self._chunk_margin_spin.setDecimals(2)
+        self._chunk_margin_spin.setSingleStep(0.5)
+        self._chunk_margin_spin.setValue(self.v._chunk_margin)
+        self._chunk_margin_spin.setToolTip(
+            "World-space prefetch margin around the frustum (RAM-buffer tier) "
+            "-- same scale as the Crop Box sliders. 0 disables the hybrid tier."
+        )
+        self._chunk_margin_spin.valueChanged.connect(self._on_chunk_margin_changed)
+
+        self._chunk_build_btn = QPushButton("Build/Rebuild Chunk Manifest")
+        self._chunk_build_btn.clicked.connect(self._on_chunk_build_clicked)
+
+        f.addRow("Enable:", self._chunk_enable_cb)
+        f.addRow("Chunk size:", self._chunk_size_spin)
+        f.addRow(self._chunk_hybrid_cb)
+        f.addRow("Margin:", self._chunk_margin_spin)
+        f.addRow("Status:", self._chunk_status_label)
+        f.addRow("Resident:", self._chunk_stats_label)
+        f.addRow(self._chunk_build_btn)
+        f.addRow(self._chunk_progress)
+
+        self._refresh_chunk_status()
         vbl.addWidget(g)
 
     def _build_compression_group(self, vbl: QVBoxLayout):
@@ -332,6 +387,58 @@ class Sidebar:
         self._culling_progress.show()
         threading.Thread(target=self.v._build_index_worker, daemon=True).start()
 
+    # ── chunk streaming callbacks ──────────────────────────────────────────────
+
+    def _refresh_chunk_status(self):
+        if not self.v._chunk_streaming_enabled:
+            self._chunk_status_label.setText("Disabled")
+            self._chunk_status_label.setStyleSheet("color: #888888;")
+            self._chunk_stats_label.setText("--")
+            return
+        if self.v._chunk_manager is None:
+            self._chunk_status_label.setText("Enabled — building...")
+            self._chunk_status_label.setStyleSheet("color: #aaaaaa;")
+            return
+        self._chunk_status_label.setText("Active")
+        self._chunk_status_label.setStyleSheet("color: #66cc66;")
+        self.update_chunk_stats(*self.v._chunk_manager.stats())
+
+    def _start_chunk_build(self):
+        self._chunk_build_btn.setEnabled(False)
+        self._chunk_enable_cb.setEnabled(False)
+        self._chunk_status_label.setText("Building chunk manifest...")
+        self._chunk_status_label.setStyleSheet("color: #aaaaaa;")
+        self._chunk_progress.show()
+        threading.Thread(target=self.v._chunk_build_worker, daemon=True).start()
+
+    def _on_chunk_streaming_toggled(self, enabled: bool):
+        self.v._chunk_streaming_enabled = enabled
+        if not enabled:
+            # v1 has no live "go back to a fully-resident model" path (that
+            # would mean re-loading the whole PLY into VRAM again) -- disabling
+            # just freezes whatever's currently resident and stops tier
+            # updates (see LocalViewer._render_loop's chunk_manager.update() gate).
+            self._chunk_status_label.setText("Disabled (resident chunks kept until relaunch)")
+            self._chunk_status_label.setStyleSheet("color: #888888;")
+            return
+        if self.v._chunk_manager is not None:
+            self._refresh_chunk_status()
+            return
+        self._start_chunk_build()
+
+    def _on_chunk_hybrid_toggled(self, enabled: bool):
+        self.v._chunk_hybrid_enabled = enabled
+        if self.v._chunk_manager is not None:
+            self.v._chunk_manager.set_hybrid(enabled, self.v._chunk_margin)
+
+    def _on_chunk_margin_changed(self, val: float):
+        self.v._chunk_margin = val
+        if self.v._chunk_manager is not None:
+            self.v._chunk_manager.set_hybrid(self.v._chunk_hybrid_enabled, val)
+
+    def _on_chunk_build_clicked(self):
+        self._start_chunk_build()
+
     # ── compression callback ───────────────────────────────────────────────────
 
     def _on_compression_changed(self, index: int):
@@ -468,6 +575,29 @@ class Sidebar:
         self._fps_label.setText(fps_str)
         self._splat_label.setText(splat_str)
         self._gpu_label.setText(gpu_str)
+
+    def on_chunk_ready(self, vram_n: int, ram_n: int, total_n: int):
+        self._chunk_build_btn.setEnabled(True)
+        self._chunk_enable_cb.setEnabled(True)
+        self._chunk_status_label.setText("Active")
+        self._chunk_status_label.setStyleSheet("color: #66cc66;")
+        self._chunk_progress.hide()
+        self.update_chunk_stats(vram_n, ram_n, total_n)
+
+    def on_chunk_build_error(self):
+        self._chunk_build_btn.setEnabled(True)
+        self._chunk_enable_cb.setEnabled(True)
+        self._chunk_status_label.setText("Build failed — see console")
+        self._chunk_status_label.setStyleSheet("color: #ff4444;")
+        self._chunk_progress.hide()
+
+    def on_chunk_oom_warning(self):
+        self._chunk_status_label.setText(
+            "VRAM pressure — some chunks skipped (try a larger margin or smaller chunk size)")
+        self._chunk_status_label.setStyleSheet("color: #ff9900;")
+
+    def update_chunk_stats(self, vram_n: int, ram_n: int, total_n: int):
+        self._chunk_stats_label.setText(f"{vram_n} VRAM / {ram_n} RAM / {total_n} total")
 
     # ── config state accessor ─────────────────────────────────────────────────
 

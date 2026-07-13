@@ -32,6 +32,25 @@ def _compressed_ply_path(ply_path: str, level: int) -> str:
     return os.path.join(d, ".kestrel", f"{stem}_L{level}.ply")
 
 
+def _chunk_manifest_path(ply_path: str) -> str:
+    """<iteration_dir>/.kestrel/<ply_stem>_chunks.idx -- the coarse,
+    disk-chunk-granularity Octree (see utils/build_chunks.py), named
+    distinctly from _idx_path's fine-grained per-frame culling index so the
+    two don't collide."""
+    d = os.path.dirname(os.path.abspath(ply_path))
+    stem = os.path.splitext(os.path.basename(ply_path))[0]
+    return os.path.join(d, ".kestrel", stem + "_chunks.idx")
+
+
+def _chunked_ply_path(ply_path: str) -> str:
+    """<iteration_dir>/.kestrel/<ply_stem>_chunked.ply -- the whole model,
+    physically reordered into chunk-contiguous order, so a chunk's rows are
+    one contiguous byte range for _load_gaussian_model_range."""
+    d = os.path.dirname(os.path.abspath(ply_path))
+    stem = os.path.splitext(os.path.basename(ply_path))[0]
+    return os.path.join(d, ".kestrel", f"{stem}_chunked.ply")
+
+
 # ── Octree index ──────────────────────────────────────────────────────────────
 
 def _load_octree(ply_path: str):
@@ -45,6 +64,31 @@ def _load_octree(ply_path: str):
     return gs2d.load_octree(idx)
 
 
+def _ply_vertex_count(path: str) -> int:
+    """Header-ish vertex count peek: plyfile memory-maps the vertex element
+    rather than reading it eagerly (see io.chunked_ply's own docstring), so
+    this is cheap even against a huge PLY. Used for chunk-manifest staleness
+    checks and OOM-dialog size estimates."""
+    from plyfile import PlyData
+    return int(PlyData.read(path).elements[0].count)
+
+
+def _load_chunk_manifest(ply_path: str):
+    """Returns the coarse chunk-manifest Octree (see utils/build_chunks.py),
+    or None if missing or stale. Stale means the manifest's total point
+    count no longer matches the source PLY's -- mirrors
+    gsplat2d_rendering.culling.cache.load_or_build_octree's own stale-cache
+    guard, just against Kestrel's own .kestrel/ path convention instead of
+    that helper's .gsplat2d_rendering/ cache dir."""
+    manifest_path = _chunk_manifest_path(ply_path)
+    if not os.path.exists(manifest_path):
+        return None
+    manifest = gs2d.load_octree(manifest_path)
+    if int(manifest.node_offsets[-1]) != _ply_vertex_count(ply_path):
+        return None
+    return manifest
+
+
 # ── PLY / GaussianModel loading ────────────────────────────────────────────────
 
 def _load_gaussian_model(path: str, sh_degree: int = -1, device: str = "cuda"):
@@ -53,6 +97,13 @@ def _load_gaussian_model(path: str, sh_degree: int = -1, device: str = "cuda"):
     files up front (see utils/compress.py), so this is always called with
     compression_level=0 (whatever the source file already contains)."""
     return gs2d.load_gaussian_model(path, sh_degree=sh_degree, device=device)
+
+
+def _load_gaussian_model_range(path: str, row_start: int, row_count: int, device: str = "cpu"):
+    """Thin wrapper over gsplat2d_rendering.load_gaussian_model_range, same
+    compression_level=0 convention as _load_gaussian_model (a chunked PLY
+    already has whatever compression the source PLY had baked in)."""
+    return gs2d.load_gaussian_model_range(path, row_start, row_count, device=device)
 
 
 def _model_to_cuda(model):

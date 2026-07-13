@@ -44,6 +44,7 @@ class RenderWidget(QLabel):
         self._no_culling_warning = False
         self._render_wh          = None   # (W, H) of the last rendered frame
         self._frustum_corners_px = None   # [8, 2] px, or None -- see set_frustum_overlay
+        self._chunk_overlay_boxes = None  # list[([8,2] px, QColor)], or None -- see set_chunk_overlay
         self._debug_banner_text  = None   # dual-camera-debug status line, or None
         self.setAlignment(Qt.AlignCenter)
         self.setMinimumSize(640, 360)
@@ -131,6 +132,14 @@ class RenderWidget(QLabel):
         self._frustum_corners_px = corners_px
         self.update()
 
+    def set_chunk_overlay(self, boxes: list[tuple[np.ndarray, QColor]] | None):
+        """boxes: list of ([8, 2] px corners, QColor) -- one entry per chunk
+        AABB worth drawing (see viewer.camera.chunk_aabb_corners_world and
+        LocalViewer._render_loop's dual-camera-debug overlay build), or
+        None to clear."""
+        self._chunk_overlay_boxes = boxes
+        self.update()
+
     def set_debug_banner(self, text: str | None):
         """Dual-camera-debug status line (which camera is displayed), or
         None to hide -- see LocalViewer._dual_camera_debug."""
@@ -153,6 +162,10 @@ class RenderWidget(QLabel):
         if self._no_culling_warning:
             p = QPainter(self)
             self._draw_culling_warning(p)
+            p.end()
+        if self._chunk_overlay_boxes:
+            p = QPainter(self)
+            self._draw_chunk_overlay(p)
             p.end()
         if self._frustum_corners_px is not None:
             p = QPainter(self)
@@ -312,7 +325,12 @@ class RenderWidget(QLabel):
                           float(tw), float(bh)),
                    Qt.AlignVCenter, text)
 
-    def _draw_frustum_overlay(self, p: QPainter):
+    def _draw_box_edges(self, p: QPainter, corners_px: np.ndarray, pen: QPen):
+        """Shared by _draw_frustum_overlay (one asymmetric view frustum) and
+        _draw_chunk_overlay (many symmetric chunk AABBs) -- both use the
+        same 4-near/4-far/4-connector corner topology (see viewer.camera's
+        frustum_corners_world / chunk_aabb_corners_world), so the pixel
+        remap + edge-skip-on-NaN logic only needs to exist once."""
         pm = self.pixmap()
         if pm is None or self._render_wh is None or self._render_wh[0] <= 0:
             return
@@ -321,14 +339,13 @@ class RenderWidget(QLabel):
         oy = (self.height() - pm.height()) / 2.0
 
         pts = []
-        for x, y in self._frustum_corners_px:
+        for x, y in corners_px:
             if math.isnan(x) or math.isnan(y):
                 pts.append(None)
             else:
                 pts.append(QPointF(ox + x * scale, oy + y * scale))
 
-        p.setRenderHint(QPainter.Antialiasing)
-        p.setPen(QPen(QColor(255, 0, 255, 220), 1.5))
+        p.setPen(pen)
 
         def _edge(i: int, j: int):
             if pts[i] is not None and pts[j] is not None:
@@ -340,6 +357,15 @@ class RenderWidget(QLabel):
             _edge(4 + i, 4 + (i + 1) % 4)
         for i in range(4):                       # near-far connectors
             _edge(i, 4 + i)
+
+    def _draw_frustum_overlay(self, p: QPainter):
+        p.setRenderHint(QPainter.Antialiasing)
+        self._draw_box_edges(p, self._frustum_corners_px, QPen(QColor(255, 0, 255, 220), 1.5))
+
+    def _draw_chunk_overlay(self, p: QPainter):
+        p.setRenderHint(QPainter.Antialiasing)
+        for corners_px, color in self._chunk_overlay_boxes:
+            self._draw_box_edges(p, corners_px, QPen(color, 1.0))
 
     def _draw_debug_banner(self, p: QPainter):
         MARGIN = 8

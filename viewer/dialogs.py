@@ -11,6 +11,39 @@ from PyQt5.QtWidgets import (
     QLabel, QLayout, QTextBrowser, QVBoxLayout,
 )
 
+
+class OomRecoveryDialog(QDialog):
+    """Shown when the initial whole-file model load runs out of GPU or host
+    memory (see viewer/app.py's OOM catch around the non-chunked load path).
+    Parented to None -- no main window exists yet at this point in startup
+    -- so this is instantiated and exec_()'d directly from __init__, not via
+    the HelpMenu-style QAction wiring the other dialogs here use."""
+
+    def __init__(self, n_splats: int | None, file_size_mb: float, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Out of memory")
+        size_note = f"~{n_splats:,} splats, " if n_splats is not None else ""
+        lbl = QLabel(
+            f"Kestrel ran out of memory loading this model ({size_note}"
+            f"{file_size_mb:.0f} MB PLY).\n\n"
+            "Chunk streaming loads only the splats near the camera into "
+            "memory, keeping the rest on disk. This requires a one-time "
+            "preprocessing pass, cached under .kestrel/ for future loads.\n\n"
+            "Enable chunk streaming? Kestrel will need to be relaunched on "
+            "this model afterward."
+        )
+        lbl.setWordWrap(True)
+        lbl.setFixedWidth(360)
+
+        bb = QDialogButtonBox(QDialogButtonBox.Yes | QDialogButtonBox.No)
+        bb.accepted.connect(self.accept)
+        bb.rejected.connect(self.reject)
+
+        lay = QVBoxLayout(self)
+        lay.setSizeConstraint(QLayout.SetFixedSize)
+        lay.addWidget(lbl)
+        lay.addWidget(bb)
+
 _RES = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "res")
 
 

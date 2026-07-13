@@ -29,6 +29,8 @@ here with an O(N) per-frame scale-tensor rewrite.
 """
 from __future__ import annotations
 
+import gc
+
 import matplotlib.pyplot as plt
 import torch
 import torch.nn.functional as F
@@ -93,24 +95,30 @@ class ViewerRenderer:
 
     # ── model / octree wiring ─────────────────────────────────────────────────
 
-    def update_pc_features(self):
+    def update_pc_features(self, verbose_log: bool = False):
         """Reorders the model into the octree's leaf-contiguous order
         (SplatRenderer's own precondition — see its class docstring) and
         (re)builds the underlying SplatRenderer. Called whenever the model
         or octree changes (new PLY installed, compression level switched,
         background index build finished). GaussianModel.reorder_ logs the
-        reorder itself (gsplat2d_rendering's own logging)."""
+        reorder itself (gsplat2d_rendering's own logging).
+
+        verbose_log forwards to reorder_/_rebuild_splat_renderer, routing
+        their summary lines through VERBOSE instead of NORMAL — pass True
+        for a caller that invokes this repeatedly (chunk streaming's
+        per-rebuild swap install), leave False for a one-off call (model
+        load, compression switch) that's worth NORMAL-level visibility."""
         if self.octree is not None and not self._spatially_ordered:
             perm = torch.from_numpy(
                 self.octree.flat_indices.astype("int64")
             ).to(self.gaussian_model.xyz.device)
-            self.gaussian_model.reorder_(perm)
+            self.gaussian_model.reorder_(perm, verbose_log=verbose_log)
             del perm
             self._spatially_ordered = True
         self._max_sh_degree = self.gaussian_model.active_sh_degree
-        self._rebuild_splat_renderer()
+        self._rebuild_splat_renderer(verbose_log=verbose_log)
 
-    def _rebuild_splat_renderer(self):
+    def _rebuild_splat_renderer(self, verbose_log: bool = False):
         """SplatRenderer's octree/culling_enabled/with_extras are
         constructor-only, so swapping the octree (background index build) or
         toggling culling means building a fresh instance — profiler state
@@ -122,12 +130,39 @@ class ViewerRenderer:
         itself, and it's what lets render_type switch live without a rebuild."""
         was_enabled = (self._splat_renderer.profiler.enabled
                        if self._splat_renderer is not None else self._profiling_wanted)
+        old_splat_renderer = self._splat_renderer
         self._splat_renderer = SplatRenderer(
             self.gaussian_model,
             octree=self.octree,
             culling_enabled=self.culling_enabled,
             with_extras=True,
+            verbose_log=verbose_log,
         )
+        # Explicit del + gc.collect() + empty_cache. The del alone is *not*
+        # enough: SplatRenderer.__init__ does `self.profiler =
+        # Profiler(sync_fn=self._sync)`, and self._sync is a bound method
+        # holding a reference back to the SplatRenderer instance itself --
+        # a genuine reference cycle (SplatRenderer -> profiler -> sync_fn ->
+        # SplatRenderer). Verified directly: with Python's automatic cyclic
+        # GC disabled, a SplatRenderer instance survives `del` entirely
+        # (still alive per a weakref check) until gc.collect() runs --
+        # refcounting alone can never free an object that's part of a
+        # cycle. Without the explicit collect() here, dead-but-uncollected
+        # instances (and the GPU tensors they still reference, including
+        # the *old* composited model, not just octree AABBs) pile up
+        # faster than Python's generational GC happens to run on its own,
+        # which is exactly what one-off calls (model load, compression
+        # switch) never do enough times to expose, but chunk streaming does
+        # every rebuild_throttle_s during continuous motion. Confirmed via
+        # torch.cuda.memory_allocated() tracing: reserved *and allocated*
+        # memory both climbed steadily even at an identical, unchanged
+        # composition across many rebuild cycles, until this collect() was
+        # added. gc.collect() must run before empty_cache() -- it's what
+        # actually drops the last reference and frees the tensors;
+        # empty_cache() only returns already-free blocks to the driver.
+        del old_splat_renderer
+        gc.collect()
+        torch.cuda.empty_cache()
         # Not exposed as a constructor/render() param on SplatRenderer —
         # background is a plain mutable instance attribute there, so this is
         # a supported way to override its (otherwise hardcoded black) default.

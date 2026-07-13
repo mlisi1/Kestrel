@@ -100,6 +100,10 @@ CONFIG_DEFAULTS: dict = {
     "show_splat_overlay": True,
     "profiling_enabled":  True,
     "verbosity":          1,       # gsplat2d_rendering log level: 0=silent, 1=normal, 2=verbose
+    "chunk_streaming_enabled": False,   # off by default -- see renderer/chunk_manager.py
+    "chunk_target_size":       500_000, # target splats/chunk, same UX as octree "Leaf size"
+    "chunk_hybrid_enabled":    False,   # RAM-buffer prefetch tier around the frustum
+    "chunk_margin":            0.0,     # world-space AABB-expansion distance for the RAM tier
 }
 
 

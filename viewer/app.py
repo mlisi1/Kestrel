@@ -12,9 +12,9 @@ import numpy as np
 import torch
 
 from PyQt5.QtCore    import Qt, QLocale, QTimer
-from PyQt5.QtGui     import QIcon
+from PyQt5.QtGui     import QColor, QIcon
 from PyQt5.QtWidgets import (
-    QApplication, QHBoxLayout, QMainWindow, QScrollArea, QWidget,
+    QApplication, QDialog, QHBoxLayout, QMainWindow, QScrollArea, QWidget,
 )
 
 _ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -24,21 +24,40 @@ _ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 # plane -- see _render_loop for the (scene-scale-relative) far plane.
 _DEBUG_FRUSTUM_ZNEAR = 0.01
 
+# Bounds ChunkManager's VRAM/RAM residency to a sane radius around the
+# camera, scaled to the current orbit distance -- needed because the octree
+# cull's frustum test is deliberately far-clip-less (correct for rendering),
+# but a residency decision needs an actual distance bound, or a chunk
+# manifold that happens to align with the camera's view direction can span
+# most of the scene regardless of true distance (measured: 3 to 56 of 66
+# chunks from the same fixed camera position, purely as a function of view
+# angle). *Not* the same 3.0x multiplier _render_loop's debug_zfar below
+# uses -- that constant sizes a debug-overlay wireframe box for legibility,
+# an unrelated concern; measured directly against a real dense scene, 3.0x
+# here let a "look straight down a dense corridor" view balloon to 50+ of 66
+# chunks (near-full-scene) while 1.5x kept the same view to 1-5 chunks.
+_CHUNK_MAX_LOAD_DISTANCE_MULT = 1.5
+
 import gsplat2d_rendering as gs2d
 
 from renderer             import ViewerRenderer
+from renderer.chunk_manager import ChunkManager
 from viewer.config        import (
     UP_AXIS_VECTORS,
     RENDER_TYPES, RENDER_TYPE_MAP,
     load_config, save_config, fmt_splats,
 )
-from viewer.camera        import OrbitCamera, frustum_corners_world, project_world_points
+from viewer.camera        import (
+    OrbitCamera, frustum_corners_world, project_world_points, chunk_aabb_corners_world,
+)
 from viewer.widgets       import RenderWidget
 from viewer.sidebar       import Sidebar
-from viewer.dialogs       import HelpMenu
+from viewer.dialogs       import HelpMenu, OomRecoveryDialog
 from viewer.ply_loader    import (
     _idx_path, _compressed_ply_path, _load_octree,
     _load_gaussian_model, _model_to_cuda,
+    _chunk_manifest_path, _chunked_ply_path, _load_chunk_manifest,
+    _load_gaussian_model_range, _ply_vertex_count,
     load_model_config, save_model_config,
 )
 
@@ -71,32 +90,54 @@ class LocalViewer(QMainWindow):
             cfg["verbosity"] = _verbosity_arg
         gs2d.set_verbosity(cfg["verbosity"])
 
-        # Determine which PLY to load (restore last-used compression level)
+        # Chunk streaming config: --chunk-size/--chunk-margin follow the same
+        # "None means use the saved default" idiom as --verbosity above.
+        # --chunk-streaming force-enables for this session only (closeEvent
+        # persists whatever's live at close time, same as --no-profiling).
+        if getattr(args, 'chunk_size', None) is not None:
+            cfg["chunk_target_size"] = args.chunk_size
+        if getattr(args, 'chunk_margin', None) is not None:
+            cfg["chunk_margin"] = args.chunk_margin
+        self._chunk_streaming_enabled = cfg["chunk_streaming_enabled"] or getattr(args, 'chunk_streaming', False)
+        self._chunk_target_size    = cfg["chunk_target_size"]
+        self._chunk_hybrid_enabled = cfg["chunk_hybrid_enabled"]
+        self._chunk_margin         = cfg["chunk_margin"]
+        self._chunk_manager: ChunkManager | None = None
+
+        # Render resolution / FOV / camera are needed up front (not just for
+        # display) — chunk streaming's initial_sync_load below needs a real
+        # gs2d.Camera to decide which chunks the starting view requires.
+        self._render_w     = cfg["render_w"]
+        self._render_h     = cfg["render_h"]
+        self._aspect_ratio = cfg["render_w"] / max(cfg["render_h"], 1)
+        self._lock_ar      = cfg["lock_ar"]
+        self.fov_deg       = cfg["fov_deg"]
+
+        self.camera = OrbitCamera(world_up=UP_AXIS_VECTORS[cfg["world_up"]].copy())
+        if "camera_look_at" in _mcfg:
+            self.camera.look_at  = np.array(_mcfg["camera_look_at"], dtype=np.float64)
+            self.camera.distance = float(_mcfg.get("camera_distance", 5.0))
+            self.camera.yaw      = float(_mcfg.get("camera_yaw",     0.0))
+            self.camera.pitch    = float(_mcfg.get("camera_pitch",   0.3))
+
+        # Determine which PLY to load (restore last-used compression level).
+        # Chunk streaming and whole-file compression levels are mutually
+        # exclusive load paths for now — see utils/build_chunks.py's own
+        # note that a chunked PLY is built from whatever compression the
+        # source already had baked in, not a live per-level choice.
         _start_compression = int(_mcfg.get("compression", 0))
         if _start_compression > 0:
             if not os.path.exists(_compressed_ply_path(ply_path, _start_compression)):
                 _start_compression = 0
         _load_path = (_compressed_ply_path(ply_path, _start_compression)
                       if _start_compression > 0 else ply_path)
-
         self._current_compression = _start_compression
-        model = _load_gaussian_model(_load_path, sh_degree=args.sh_degree, device="cuda")
-        self._ply_sh_degree = model.active_sh_degree
 
-        if getattr(args, 'build_index', False):
-            from utils.build_index import read_xyz
-            idx_path = _idx_path(ply_path)
-            os.makedirs(os.path.dirname(idx_path), exist_ok=True)
-            xyz = read_xyz(ply_path)
-            octree = gs2d.build_octree(xyz, leaf_max=getattr(args, 'leaf_max', 5000))
-            # Not gs2d.save_octree(idx_path, ...): a plain string/Path lets
-            # np.savez_compressed silently append ".npz" to it — writing
-            # through an open handle (save_octree passes file-like objects
-            # through untouched) keeps the literal ".idx" filename.
-            with open(idx_path, "wb") as fh:
-                gs2d.save_octree(fh, octree)
+        if self._chunk_streaming_enabled:
+            model, octree = self._load_chunked(ply_path, args)
         else:
-            octree = _load_octree(ply_path)
+            model, octree = self._load_whole_file(ply_path, _load_path, args, cfg)
+        self._ply_sh_degree = model.active_sh_degree
 
         self._total_vram = (torch.cuda.get_device_properties(self.device)
                             .total_memory / 1024**2)
@@ -111,13 +152,6 @@ class LocalViewer(QMainWindow):
             profiling_enabled=cfg["profiling_enabled"] and not getattr(args, 'no_profiling', False),
         )
 
-        self.camera = OrbitCamera(world_up=UP_AXIS_VECTORS[cfg["world_up"]].copy())
-        if "camera_look_at" in _mcfg:
-            self.camera.look_at  = np.array(_mcfg["camera_look_at"], dtype=np.float64)
-            self.camera.distance = float(_mcfg.get("camera_distance", 5.0))
-            self.camera.yaw      = float(_mcfg.get("camera_yaw",     0.0))
-            self.camera.pitch    = float(_mcfg.get("camera_pitch",   0.3))
-
         # Dual-camera debug mode (--debug-dual-camera): camera_b is a
         # free-fly observer, entirely separate from camera A (the real
         # render camera, always keyboard-controlled -- see _kb_tick). Mouse
@@ -129,12 +163,6 @@ class LocalViewer(QMainWindow):
                           if self._dual_camera_debug else None)
         self._viewing_camera_b = False
 
-        self._render_w     = cfg["render_w"]
-        self._render_h     = cfg["render_h"]
-        self._aspect_ratio = cfg["render_w"] / max(cfg["render_h"], 1)
-        self._lock_ar      = cfg["lock_ar"]
-
-        self.fov_deg        = cfg["fov_deg"]
         self.render_type    = cfg["render_type"] if cfg["render_type"] in RENDER_TYPES else "RGB"
         self.render_type1   = _mcfg.get("render_type1",  "RGB")
         self.render_type2   = _mcfg.get("render_type2",  "RGB")
@@ -178,6 +206,12 @@ class LocalViewer(QMainWindow):
         self._ply_loaded_level    = None
         self._compress_error_flag = False
 
+        # Background chunk-manifest build state (mirrors the two blocks above)
+        self._chunk_build_pending      = None   # ChunkManager, once built/loaded
+        self._chunk_build_ready_flag   = False
+        self._chunk_build_error_flag   = False
+        self._chunk_oom_flag           = False
+
         self._build_ui()
 
         if not self._no_culling_flag and self.renderer.octree is None:
@@ -193,6 +227,112 @@ class LocalViewer(QMainWindow):
         self._kb_timer.start(16)
 
         self._render_trig.set()
+
+    # ── Model loading ──────────────────────────────────────────────────────────
+
+    def _load_whole_file(self, ply_path: str, _load_path: str, args, cfg):
+        """Non-chunked startup path: the entire PLY into VRAM up front.
+        Wrapped in an OOM catch -- see _prompt_oom_recovery. v1 is
+        exit-and-relaunch, not in-process retry (see OomRecoveryDialog's own
+        docstring): recovering from a failed .to("cuda") in-process, before
+        any window/progress-UI exists, is meaningfully more fragile than one
+        extra manual relaunch."""
+        try:
+            model = _load_gaussian_model(_load_path, sh_degree=args.sh_degree, device="cuda")
+        except (torch.cuda.OutOfMemoryError, MemoryError):
+            torch.cuda.empty_cache()
+            self._prompt_oom_recovery(ply_path)  # never returns
+
+        if getattr(args, 'build_index', False):
+            from utils.build_index import read_xyz
+            idx_path = _idx_path(ply_path)
+            os.makedirs(os.path.dirname(idx_path), exist_ok=True)
+            xyz = read_xyz(ply_path)
+            octree = gs2d.build_octree(xyz, leaf_max=getattr(args, 'leaf_max', 5000))
+            # Not gs2d.save_octree(idx_path, ...): a plain string/Path lets
+            # np.savez_compressed silently append ".npz" to it — writing
+            # through an open handle (save_octree passes file-like objects
+            # through untouched) keeps the literal ".idx" filename.
+            with open(idx_path, "wb") as fh:
+                gs2d.save_octree(fh, octree)
+        else:
+            octree = _load_octree(ply_path)
+        return model, octree
+
+    def _prompt_oom_recovery(self, ply_path: str) -> None:
+        """Shown once from __init__, before any window exists (dialog
+        parented to None). Never returns — always exits the process."""
+        try:
+            n_splats = _ply_vertex_count(ply_path)
+        except Exception:
+            n_splats = None
+        size_mb = os.path.getsize(ply_path) / 1024**2
+
+        app = QApplication.instance() or QApplication(sys.argv)
+        dlg = OomRecoveryDialog(n_splats, size_mb, parent=None)
+        if dlg.exec_() == QDialog.Accepted:
+            mcfg = load_model_config(ply_path)
+            mcfg["chunk_streaming_enabled"] = True
+            mcfg.setdefault("chunk_target_size", 500_000)
+            save_model_config(ply_path, mcfg)
+            print("[viewer] Chunk streaming enabled for this model — "
+                  "relaunch Kestrel on it to continue.")
+        else:
+            print("[viewer] Out of memory loading this model. Exiting.")
+        sys.exit(0)
+
+    def _build_chunks_blocking(self, ply_path: str) -> None:
+        from utils.build_chunks import build_chunks
+        build_chunks(ply_path, chunk_size=self._chunk_target_size)
+
+    def _load_chunked(self, ply_path: str, args):
+        """Chunk-streaming startup path: build/load the manifest + chunk-
+        reordered PLY (blocking, same category as today's synchronous
+        --build-index), construct ChunkManager, and load whatever the
+        starting camera pose needs. culling_enabled for the resulting fine
+        octree is always True regardless of --no-culling — chunk residency
+        and per-frame GPU culling are independent concerns (see
+        renderer/chunk_manager.py)."""
+        manifest = None if getattr(args, 'build_chunks', False) else _load_chunk_manifest(ply_path)
+        if manifest is None:
+            self._build_chunks_blocking(ply_path)
+            manifest = _load_chunk_manifest(ply_path)
+
+        chunked_path = _chunked_ply_path(ply_path)
+        self._chunk_manager = ChunkManager(
+            chunked_path, manifest, device=str(self.device),
+            hybrid_enabled=self._chunk_hybrid_enabled, margin=self._chunk_margin,
+            fine_leaf_max=self._leaf_max,
+        )
+        cam = self._build_camera(max(self._render_w, 2), max(self._render_h, 2), self.camera)
+        max_load_distance = self.camera.distance * _CHUNK_MAX_LOAD_DISTANCE_MULT
+        return self._chunk_manager.initial_sync_load(cam, max_load_distance=max_load_distance)
+
+    def _chunk_build_worker(self):
+        """Background worker for the sidebar's mid-session 'enable chunk
+        streaming' / 'Build/Rebuild Chunk Manifest' actions — mirrors
+        _build_index_worker's shape (build if needed, construct
+        ChunkManager, initial_sync_load, all off the render/Qt thread), then
+        hands the ready pieces to _render_loop via _chunk_build_pending."""
+        try:
+            manifest = _load_chunk_manifest(self.ply_path)
+            if manifest is None:
+                self._build_chunks_blocking(self.ply_path)
+                manifest = _load_chunk_manifest(self.ply_path)
+            chunked_path = _chunked_ply_path(self.ply_path)
+            chunk_manager = ChunkManager(
+                chunked_path, manifest, device=str(self.device),
+                hybrid_enabled=self._chunk_hybrid_enabled, margin=self._chunk_margin,
+                fine_leaf_max=self._leaf_max,
+            )
+            cam = self._build_camera(max(self._render_w, 2), max(self._render_h, 2), self.camera)
+            max_load_distance = self.camera.distance * _CHUNK_MAX_LOAD_DISTANCE_MULT
+            model, octree = chunk_manager.initial_sync_load(cam, max_load_distance=max_load_distance)
+            self._chunk_build_pending = (chunk_manager, model, octree)
+            self._render_trig.set()
+        except Exception:
+            import traceback; traceback.print_exc()
+            self._chunk_build_error_flag = True
 
     # ── UI construction ────────────────────────────────────────────────────────
 
@@ -421,6 +561,25 @@ class LocalViewer(QMainWindow):
                 self._ply_sh_degree    = self.renderer.gaussian_model.active_sh_degree
                 self._ply_loaded_level = level
 
+            chunk_pending = self._chunk_build_pending
+            if chunk_pending is not None:
+                self._chunk_build_pending = None
+                chunk_manager, model, octree = chunk_pending
+                self._chunk_manager = chunk_manager
+                # Explicit del + empty_cache so a mid-session "enable chunk
+                # streaming" toggle actually frees the old whole-file
+                # model's VRAM on this same frame, not whenever GC gets to
+                # it — see the sidebar's VRAM readout for verification.
+                old_model = self.renderer.gaussian_model
+                self.renderer.gaussian_model = model
+                del old_model
+                torch.cuda.empty_cache()
+                self.renderer.octree = octree
+                self.renderer._spatially_ordered = False
+                self.renderer.culling_enabled = True
+                self.renderer.update_pc_features()
+                self._chunk_build_ready_flag = True
+
             W = max(self._render_w, 2)
             H = max(self._render_h, 2)
             valid_range = (self.crop_x, self.crop_y, self.crop_z) if self.crop_enabled else None
@@ -428,6 +587,50 @@ class LocalViewer(QMainWindow):
             t0 = time.perf_counter()
             try:
                 cam = self._build_camera(W, H, self.camera)
+
+                if self._chunk_manager is not None and self._chunk_streaming_enabled:
+                    # Laps onto the same shared Profiler instance get_outputs()
+                    # below uses (ViewerRenderer.profiler is SplatRenderer's own
+                    # instance, not a second one -- see CLAUDE.md's "Render
+                    # pipeline" section) so chunk-streaming cost shows up in the
+                    # same printed breakdown instead of being invisible line
+                    # noise before the "real" render starts. Profiler.start()
+                    # is safe to call again inside get_outputs() right after --
+                    # it only resets the per-frame _last snapshot, not the
+                    # accumulated stats() this lap has already landed in (see
+                    # that class's own docstring: multiple layers lapping onto
+                    # one shared instance is a designed feature, not a hack).
+                    self.renderer.profiler.start()
+                    max_load_distance = self.camera.distance * _CHUNK_MAX_LOAD_DISTANCE_MULT
+                    self._chunk_manager.update(cam, max_load_distance=max_load_distance)
+                    self.renderer.profiler.lap("chunk_update")
+                    swap = self._chunk_manager.drain_pending_swap()
+                    if swap is not None:
+                        # Explicit del of the old merged model before
+                        # update_pc_features() below builds its own
+                        # replacement tensors (reorder_) and a fresh
+                        # SplatRenderer -- same reasoning as the toggle-on
+                        # path above (_chunk_build_pending): drop the old
+                        # reference immediately rather than leaving it for
+                        # whenever GC gets to it, reducing peak transient
+                        # VRAM during a swap that (during chunk streaming)
+                        # can land as often as every rebuild_throttle_s.
+                        old_model = self.renderer.gaussian_model
+                        self.renderer.gaussian_model, self.renderer.octree = swap
+                        del old_model
+                        self.renderer._spatially_ordered = False
+                        self.renderer.culling_enabled = True
+                        # verbose_log=True: this swap can land as often as
+                        # every rebuild_throttle_s during continuous camera
+                        # motion -- its "Reordered"/"Culling enabled" lines
+                        # would otherwise flood NORMAL-level console output
+                        # with one pair of lines per rebuild.
+                        self.renderer.update_pc_features(verbose_log=True)
+                        self.renderer.profiler.lap("chunk_swap")
+                    if self._chunk_manager.last_oom_chunk_id is not None:
+                        self._chunk_manager.last_oom_chunk_id = None
+                        self._chunk_oom_flag = True
+
                 viewing_b = self._dual_camera_debug and self._viewing_camera_b
                 cam_b = self._build_camera(W, H, self.camera_b) if self._dual_camera_debug else None
                 frustum_overlay = None
@@ -446,6 +649,34 @@ class LocalViewer(QMainWindow):
                         _DEBUG_FRUSTUM_ZNEAR, debug_zfar,
                     )
                     frustum_overlay = project_world_points(corners_world, cam_b)
+
+                chunk_overlay = None
+                if viewing_b and self._chunk_manager is not None:
+                    # Rebuilt from ground truth every frame (cheap -- bounded
+                    # by total chunk count) rather than cached/invalidated on
+                    # transition, so a chunk that just changed tier shows the
+                    # new color on the very next repaint with no separate
+                    # bookkeeping needed.
+                    states = self._chunk_manager.chunk_states()
+                    aabbs = self._chunk_manager.manifest.node_aabbs
+                    visible_to_b = self._chunk_manager.visible_chunk_ids(cam_b)
+                    boxes = []
+                    for cid in visible_to_b | set(states.keys()):
+                        state = states.get(cid)
+                        if state == "vram":
+                            color = QColor(80, 220, 80, 200)
+                        elif state == "ram":
+                            color = QColor(255, 165, 0, 160)
+                        elif cid in visible_to_b:
+                            # Disk-only, but currently in camera B's own view --
+                            # bounds overlay cost/clutter to what B can actually see.
+                            color = QColor(180, 40, 40, 90)
+                        else:
+                            continue
+                        corners_world_cid = chunk_aabb_corners_world(aabbs[cid])
+                        boxes.append((project_world_points(corners_world_cid, cam_b), color))
+                    chunk_overlay = boxes
+
                 with torch.no_grad():
                     image = self.renderer.get_outputs(
                         cam,
@@ -480,7 +711,7 @@ class LocalViewer(QMainWindow):
 
             with self._frame_lock:
                 self._frame_slot = (img_np, fps_str, gpu_str, fps_val, n_splats,
-                                    fmt_splats(n_splats), frustum_overlay)
+                                    fmt_splats(n_splats), frustum_overlay, chunk_overlay)
 
     # ── Frame polling ──────────────────────────────────────────────────────────
 
@@ -501,15 +732,27 @@ class LocalViewer(QMainWindow):
         if self._compress_error_flag:
             self._compress_error_flag = False
             self._sidebar.on_compress_error(self._current_compression)
+        if self._chunk_build_ready_flag:
+            self._chunk_build_ready_flag = False
+            self._sidebar.on_chunk_ready(*self._chunk_manager.stats())
+        if self._chunk_build_error_flag:
+            self._chunk_build_error_flag = False
+            self._sidebar.on_chunk_build_error()
+        if self._chunk_oom_flag:
+            self._chunk_oom_flag = False
+            self._sidebar.on_chunk_oom_warning()
+        if self._chunk_manager is not None:
+            self._sidebar.update_chunk_stats(*self._chunk_manager.stats())
 
         with self._frame_lock:
             slot, self._frame_slot = self._frame_slot, None
         if slot is None:
             return
-        img_np, fps_str, gpu_str, fps_val, n_splats, splat_str, frustum_overlay = slot
+        img_np, fps_str, gpu_str, fps_val, n_splats, splat_str, frustum_overlay, chunk_overlay = slot
         self.render_widget.set_frame(img_np)
         if self._dual_camera_debug:
             self.render_widget.set_frustum_overlay(frustum_overlay)
+            self.render_widget.set_chunk_overlay(chunk_overlay)
         if fps_val > 0:
             self.render_widget.update_fps(fps_val)
         if n_splats > 0:
@@ -548,6 +791,10 @@ class LocalViewer(QMainWindow):
             "show_splat_overlay": ui["show_splat_overlay"],
             "profiling_enabled":  self.renderer.profiling_enabled,
             "verbosity":          gs2d.get_verbosity(),
+            "chunk_streaming_enabled": self._chunk_streaming_enabled,
+            "chunk_target_size":       self._chunk_target_size,
+            "chunk_hybrid_enabled":    self._chunk_hybrid_enabled,
+            "chunk_margin":            self._chunk_margin,
         })
         save_config(self._cfg)
         save_model_config(self.ply_path, {

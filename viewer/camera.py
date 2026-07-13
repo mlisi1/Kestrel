@@ -157,6 +157,21 @@ def frustum_corners_world(orbit_cam: OrbitCamera, fov_deg: float, aspect: float,
     return corners
 
 
+def chunk_aabb_corners_world(aabb: np.ndarray) -> np.ndarray:
+    """8 world-space corners of an axis-aligned box (aabb =
+    [xmin,ymin,zmin,xmax,ymax,zmax], the exact row format of
+    gsplat2d_rendering.Octree.node_aabbs), in the same 4-near/4-far/
+    4-connector edge topology frustum_corners_world uses (0-3 a quad loop,
+    4-7 a second quad loop, i<->i+4 the connectors) -- letting
+    RenderWidget's box-edge drawing be shared between an asymmetric view
+    frustum and a symmetric chunk AABB with no special-casing."""
+    xmin, ymin, zmin, xmax, ymax, zmax = aabb
+    return np.array([
+        [xmin, ymin, zmin], [xmax, ymin, zmin], [xmax, ymax, zmin], [xmin, ymax, zmin],
+        [xmin, ymin, zmax], [xmax, ymin, zmax], [xmax, ymax, zmax], [xmin, ymax, zmax],
+    ], dtype=np.float64)
+
+
 def project_world_points(points_world: np.ndarray, cam) -> np.ndarray:
     """Projects [N, 3] world points through cam.full_proj_transform to
     [N, 2] pixel coordinates in cam.width x cam.height space, using the
